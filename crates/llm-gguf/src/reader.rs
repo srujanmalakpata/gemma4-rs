@@ -1,6 +1,8 @@
 use std::{
     collections::HashMap,
+    fs::File,
     io::{self, Read, Seek, SeekFrom},
+    path::{Path, PathBuf},
     str,
 };
 
@@ -17,6 +19,12 @@ const ALIGNMENT: u64 = 32;
 pub enum GgufError {
     #[error("I/O error: {0}")]
     Io(#[from] io::Error),
+    #[error("I/O error reading `{path}`: {source}")]
+    IoPath {
+        path: PathBuf,
+        #[source]
+        source: io::Error,
+    },
     #[error("invalid GGUF magic {found:#010x}")]
     InvalidMagic { found: u32 },
     #[error("unsupported GGUF version {found}; expected {expected}")]
@@ -43,6 +51,9 @@ enum MetadataValue {
     F32(f32),
     Bool(bool),
     String(String),
+    Strings(Vec<String>),
+    F32s(Vec<f32>),
+    I32s(Vec<i32>),
     Array,
 }
 
@@ -54,6 +65,20 @@ pub struct GgufFile<R> {
     tensors: HashMap<String, TensorDescriptor>,
     tensor_order: Vec<String>,
     data_offset: u64,
+}
+
+impl GgufFile<File> {
+    pub fn open_path(path: impl AsRef<Path>) -> Result<Self, GgufError> {
+        let path = path.as_ref().to_path_buf();
+        let reader = File::open(&path).map_err(|source| GgufError::IoPath {
+            path: path.clone(),
+            source,
+        })?;
+        Self::open_read(reader).map_err(|error| match error {
+            GgufError::Io(source) => GgufError::IoPath { path, source },
+            error => error,
+        })
+    }
 }
 
 impl<R: Read + Seek> GgufFile<R> {
@@ -145,6 +170,27 @@ impl<R: Read + Seek> GgufFile<R> {
         }
     }
 
+    pub fn metadata_strings(&self, key: &str) -> Option<&[String]> {
+        match self.metadata.get(key) {
+            Some(MetadataValue::Strings(values)) => Some(values),
+            _ => None,
+        }
+    }
+
+    pub fn metadata_f32s(&self, key: &str) -> Option<&[f32]> {
+        match self.metadata.get(key) {
+            Some(MetadataValue::F32s(values)) => Some(values),
+            _ => None,
+        }
+    }
+
+    pub fn metadata_i32s(&self, key: &str) -> Option<&[i32]> {
+        match self.metadata.get(key) {
+            Some(MetadataValue::I32s(values)) => Some(values),
+            _ => None,
+        }
+    }
+
     pub fn tensor_names(&self) -> Vec<&str> {
         self.tensor_order.iter().map(String::as_str).collect()
     }
@@ -201,10 +247,7 @@ fn read_metadata_value<R: Read>(
         9 => {
             let element_ty = read_u32(reader)?;
             let count = read_u64(reader)?;
-            for _ in 0..count {
-                skip_metadata_value(reader, key, element_ty)?;
-            }
-            Ok(MetadataValue::Array)
+            read_metadata_array(reader, key, element_ty, count)
         }
         10 => Ok(MetadataValue::U64(read_u64(reader)?)),
         _ => Err(GgufError::UnsupportedMetadataType {
@@ -214,13 +257,42 @@ fn read_metadata_value<R: Read>(
     }
 }
 
+fn read_metadata_array<R: Read>(
+    reader: &mut R,
+    key: &str,
+    element_ty: u32,
+    count: u64,
+) -> Result<MetadataValue, GgufError> {
+    match element_ty {
+        5 => (0..count)
+            .map(|_| read_i32(reader))
+            .collect::<Result<Vec<_>, _>>()
+            .map(MetadataValue::I32s),
+        6 => (0..count)
+            .map(|_| read_f32(reader))
+            .collect::<Result<Vec<_>, _>>()
+            .map(MetadataValue::F32s),
+        8 => (0..count)
+            .map(|_| read_string(reader, "metadata array string"))
+            .collect::<Result<Vec<_>, _>>()
+            .map(MetadataValue::Strings),
+        _ => {
+            for _ in 0..count {
+                skip_metadata_value(reader, key, element_ty)?;
+            }
+            Ok(MetadataValue::Array)
+        }
+    }
+}
+
 fn skip_metadata_value<R: Read>(reader: &mut R, key: &str, ty: u32) -> Result<(), GgufError> {
     match ty {
-        4 => read_u32(reader).map(|_| ()),
-        6 => read_f32(reader).map(|_| ()),
+        0 | 1 => skip_bytes(reader, 1),
+        2 | 3 => skip_bytes(reader, 2),
+        4 | 5 | 6 => skip_bytes(reader, 4),
         7 => read_bool(reader).map(|_| ()),
         8 => read_string(reader, "metadata array string").map(|_| ()),
-        10 => read_u64(reader).map(|_| ()),
+        10 | 11 | 12 => skip_bytes(reader, 8),
         _ => Err(GgufError::UnsupportedMetadataType {
             key: key.to_owned(),
             ty,
@@ -288,6 +360,12 @@ fn read_u32<R: Read>(reader: &mut R) -> Result<u32, GgufError> {
     Ok(u32::from_le_bytes(bytes))
 }
 
+fn read_i32<R: Read>(reader: &mut R) -> Result<i32, GgufError> {
+    let mut bytes = [0; 4];
+    reader.read_exact(&mut bytes)?;
+    Ok(i32::from_le_bytes(bytes))
+}
+
 fn read_u64<R: Read>(reader: &mut R) -> Result<u64, GgufError> {
     let mut bytes = [0; 8];
     reader.read_exact(&mut bytes)?;
@@ -298,6 +376,12 @@ fn read_f32<R: Read>(reader: &mut R) -> Result<f32, GgufError> {
     let mut bytes = [0; 4];
     reader.read_exact(&mut bytes)?;
     Ok(f32::from_le_bytes(bytes))
+}
+
+fn skip_bytes<R: Read>(reader: &mut R, length: usize) -> Result<(), GgufError> {
+    let mut bytes = [0; 8];
+    reader.read_exact(&mut bytes[..length])?;
+    Ok(())
 }
 
 fn to_usize(value: u64) -> Result<usize, GgufError> {
