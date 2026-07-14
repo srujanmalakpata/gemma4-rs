@@ -170,6 +170,14 @@ impl<R: Read + Seek> GgufFile<R> {
         }
     }
 
+    pub fn metadata_usize(&self, key: &str) -> Option<usize> {
+        match self.metadata.get(key) {
+            Some(MetadataValue::U32(value)) => Some(*value as usize),
+            Some(MetadataValue::U64(value)) => usize::try_from(*value).ok(),
+            _ => None,
+        }
+    }
+
     pub fn metadata_strings(&self, key: &str) -> Option<&[String]> {
         match self.metadata.get(key) {
             Some(MetadataValue::Strings(values)) => Some(values),

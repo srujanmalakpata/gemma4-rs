@@ -3,15 +3,15 @@ use llm_eng::{
     sample::SamplingConfig,
 };
 use llm_gemma4::{
-    generate::{generate_cpu, GenerateRequest},
+    generate::{generate_cpu, generate_cpu_recompute, GenerateRequest},
     idea::{Gemma4HyperParams, GlobalPRope},
-    model::Gemma4CpuModel,
+    model::{Gemma4CpuModel, HeadConfig},
 };
 use llm_idea::types::TokenId;
 
 fn synthetic_hp() -> Gemma4HyperParams {
     Gemma4HyperParams {
-        n_layers: 2,
+        n_layers: 4,
         vocab_size: 32,
         d_model: 32,
         ple_dim: 0,
@@ -38,12 +38,17 @@ fn generate_matches_between_cache_strategies() {
         },
         max_context: 16,
     };
-    let mut cached = Gemma4CpuModel::<KvCache<Vec<f32>, Vec<f32>>>::synthetic(7, hp.clone());
+    let heads = HeadConfig {
+        n_heads: 4,
+        n_kv_heads: 2,
+    };
+    let mut cached =
+        Gemma4CpuModel::<KvCache<Vec<f32>, Vec<f32>>>::synthetic_with_heads(7, hp.clone(), heads);
     let mut recomputed =
-        Gemma4CpuModel::<FullRecompute<Vec<f32>, Vec<f32>>>::synthetic(7, hp);
+        Gemma4CpuModel::<FullRecompute<Vec<f32>, Vec<f32>>>::synthetic_with_heads(7, hp, heads);
 
     let cached_tokens = generate_cpu(&mut cached, request).unwrap();
-    let recomputed_tokens = generate_cpu(&mut recomputed, request).unwrap();
+    let recomputed_tokens = generate_cpu_recompute(&mut recomputed, request).unwrap();
 
     assert_eq!(cached_tokens.len(), 3);
     assert_eq!(cached_tokens, recomputed_tokens);

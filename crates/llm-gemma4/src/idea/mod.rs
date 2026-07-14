@@ -40,6 +40,23 @@ impl Gemma4HyperParams {
             },
         }
     }
+
+    /// Reads portable GGUF architecture metadata, retaining E2B defaults for
+    /// optional fields that older conversions omit.
+    pub fn from_gguf_metadata<R: std::io::Read + std::io::Seek>(
+        gguf: &llm_gguf::reader::GgufFile<R>,
+    ) -> Self {
+        let defaults = Self::e2b();
+        let arch = gguf.metadata_str("general.architecture").unwrap_or("gemma4");
+        let key = |suffix: &str| format!("{arch}.{suffix}");
+        Self {
+            n_layers: gguf.metadata_usize(&key("block_count")).unwrap_or(defaults.n_layers),
+            d_model: gguf.metadata_usize(&key("embedding_length")).unwrap_or(defaults.d_model),
+            vocab_size: gguf.metadata_strings("tokenizer.ggml.tokens").map_or(defaults.vocab_size, <[String]>::len),
+            sliding_window: gguf.metadata_usize(&key("sliding_window")).unwrap_or(defaults.sliding_window),
+            ..defaults
+        }
+    }
 }
 
 pub fn layer_attention_kind(hp: &Gemma4HyperParams, layer: usize) -> AttentionKind {

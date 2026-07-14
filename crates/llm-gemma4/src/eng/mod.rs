@@ -69,3 +69,9 @@ pub fn kv_slot(layer: usize, n_layers: usize, n_slots: usize) -> Result<usize, K
     }
     Ok(layer * n_slots / n_layers)
 }
+
+/// The lowest-numbered layer assigned to a slot writes that slot's K/V.
+pub fn is_kv_owner(layer: usize, n_layers: usize, n_slots: usize) -> Result<bool, KvSlotError> {
+    let slot = kv_slot(layer, n_layers, n_slots)?;
+    Ok((0..layer).all(|other| kv_slot(other, n_layers, n_slots) != Ok(slot)))
+}
