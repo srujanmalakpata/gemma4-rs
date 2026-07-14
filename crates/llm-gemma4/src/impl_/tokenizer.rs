@@ -8,6 +8,27 @@ const TOKENS_KEY: &str = "tokenizer.ggml.tokens";
 const SCORES_KEY: &str = "tokenizer.ggml.scores";
 const TYPES_KEY: &str = "tokenizer.ggml.token_type";
 
+/// SentencePiece `tokenizer.ggml.token_type` values (GGUF / llama.cpp convention).
+const SP_NORMAL: i32 = 1;
+const SP_UNKNOWN: i32 = 2;
+const SP_CONTROL: i32 = 3;
+const SP_USER_DEFINED: i32 = 4;
+const SP_UNUSED: i32 = 5;
+const SP_BYTE: i32 = 6;
+
+/// Types eligible for longest-prefix greedy matching on user text.
+/// CONTROL, UNKNOWN, UNUSED, and USER_DEFINED are special/reserved; BYTE is kept
+/// for the unknown-char fallback path (not greedy prefix match).
+fn is_greedy_matchable(token_type: i32) -> bool {
+    if matches!(
+        token_type,
+        SP_UNKNOWN | SP_CONTROL | SP_USER_DEFINED | SP_UNUSED | SP_BYTE
+    ) {
+        return false;
+    }
+    token_type == SP_NORMAL
+}
+
 #[derive(Debug, Error)]
 pub enum TokenizerError {
     #[error("GGUF metadata `{0}` is missing")]
@@ -23,6 +44,7 @@ pub enum TokenizerError {
 pub struct Tokenizer {
     tokens: Vec<String>,
     scores: Vec<f32>,
+    token_types: Vec<i32>,
     bos: Option<TokenId>,
     eos: Option<TokenId>,
     unknown: Option<TokenId>,
@@ -43,13 +65,14 @@ impl Tokenizer {
         Self::from_parts(
             tokens.to_vec(),
             scores.to_vec(),
-            token_types.len(),
+            token_types.to_vec(),
             gguf.metadata_u32("tokenizer.ggml.bos_token_id"),
             gguf.metadata_u32("tokenizer.ggml.eos_token_id"),
         )
     }
 
     pub fn encode(&self, text: &str, add_bos: bool) -> Vec<TokenId> {
+        // ponytail: greedy SP encode — upgrade to full SentencePiece proto if mismatch vs golden; O(chars×vocab) scan per step
         let mut ids = Vec::new();
         if add_bos {
             ids.extend(self.bos);
@@ -62,7 +85,11 @@ impl Tokenizer {
                 .tokens
                 .iter()
                 .enumerate()
-                .filter(|(_, token)| !is_special(token) && remaining.starts_with(token.as_str()))
+                .filter(|(id, token)| {
+                    is_greedy_matchable(self.token_types[*id])
+                        && !is_special(token)
+                        && remaining.starts_with(token.as_str())
+                })
                 .max_by(|(left_id, left), (right_id, right)| {
                     left.len()
                         .cmp(&right.len())
@@ -73,8 +100,12 @@ impl Tokenizer {
                 ids.push(TokenId(id as u32));
                 remaining = &remaining[token.len()..];
             } else {
-                ids.extend(self.unknown);
                 let next = remaining.chars().next().expect("remaining is non-empty");
+                let byte_id = self.tokens.iter().enumerate().find_map(|(id, token)| {
+                    (self.token_types[id] == SP_BYTE && byte_token(token) == Some(next as u8))
+                        .then_some(TokenId(id as u32))
+                });
+                ids.extend(byte_id.or(self.unknown));
                 remaining = &remaining[next.len_utf8()..];
             }
         }
@@ -113,15 +144,15 @@ impl Tokenizer {
     fn from_parts(
         tokens: Vec<String>,
         scores: Vec<f32>,
-        token_types: usize,
+        token_types: Vec<i32>,
         bos: Option<u32>,
         eos: Option<u32>,
     ) -> Result<Self, TokenizerError> {
-        if tokens.len() != scores.len() || tokens.len() != token_types {
+        if tokens.len() != scores.len() || tokens.len() != token_types.len() {
             return Err(TokenizerError::MismatchedMetadata {
                 tokens: tokens.len(),
                 scores: scores.len(),
-                token_types,
+                token_types: token_types.len(),
             });
         }
         let find = |names: &[&str]| {
@@ -136,6 +167,7 @@ impl Tokenizer {
             eos: eos.map(TokenId).or_else(|| find(&["<eos>", "</s>"])),
             tokens,
             scores,
+            token_types,
         })
     }
 }
@@ -175,7 +207,14 @@ mod tests {
                 "world".into(),
             ],
             vec![0.0; 6],
-            6,
+            vec![
+                SP_UNKNOWN,
+                SP_CONTROL,
+                SP_CONTROL,
+                SP_NORMAL,
+                SP_NORMAL,
+                SP_NORMAL,
+            ],
             None,
             None,
         )
