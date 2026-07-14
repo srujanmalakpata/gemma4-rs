@@ -87,6 +87,14 @@ dependencies = [
 [[package]]
 name = "llm-gemma4"
 version = "0.1.0"
+dependencies = [
+ "half",
+ "llm-backend-cpu",
+ "llm-eng",
+ "llm-gguf",
+ "llm-idea",
+ "thiserror",
+]
 
 [[package]]
 name = "llm-gguf"
