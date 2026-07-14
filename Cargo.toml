@@ -21,6 +21,7 @@ llm-gguf = { path = "crates/llm-gguf" }
 llm-backend-cpu = { path = "crates/llm-backend-cpu" }
 llm-gemma4 = { path = "crates/llm-gemma4" }
 thiserror = "2"
+rand = "0.10.2"
 anyhow = "1"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
