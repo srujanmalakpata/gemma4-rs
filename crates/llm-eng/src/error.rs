@@ -4,6 +4,8 @@ use thiserror::Error;
 pub enum EngError {
     #[error("context length {got} exceeds configured max {max}")]
     ContextTooLong { got: usize, max: usize },
+    #[error("layer {0} has no cached K/V")]
+    MissingLayer(usize),
     #[error("missing weight `{0}`")]
     MissingWeight(String),
     #[error("compute: {0}")]

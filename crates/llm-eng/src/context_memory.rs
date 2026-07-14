@@ -1,3 +1,8 @@
+//! Both strategies retain appended K/V pairs in v1. The driver rebuilds
+//! FullRecompute inputs on each pass; later engines may replace its storage.
+//! Model code always attends over the slices returned by `view`; windowing
+//! belongs in the engine through truncation or masking.
+
 use crate::EngError;
 
 pub trait ContextMemory {
@@ -47,7 +52,7 @@ fn view<K, V>(layers: &[Layer<K, V>], layer: usize, len: usize) -> Result<(&[K],
         return if len == 0 {
             Ok((&[], &[]))
         } else {
-            Err(EngError::ContextTooLong { got: len, max: 0 })
+            Err(EngError::MissingLayer(layer))
         };
     };
 
@@ -94,7 +99,16 @@ impl<K, V> ContextMemory for FullRecompute<K, V> {
     }
 }
 
-// Both strategies retain appended K/V pairs in v1. The driver rebuilds
-// FullRecompute inputs on each pass; later engines may replace its storage.
-// Model code always attends over the slices returned by `view`; windowing
-// belongs in the engine through truncation or masking.
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn view_missing_layer_returns_missing_layer_error() {
+        let cache = KvCache::<f32, f32>::default();
+        assert!(matches!(
+            cache.view(0, 1),
+            Err(EngError::MissingLayer(0))
+        ));
+    }
+}
