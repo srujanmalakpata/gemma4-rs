@@ -1,3 +1,2 @@
-pub fn ping() -> &'static str {
-    "ok"
-}
+pub mod eng;
+pub mod idea;

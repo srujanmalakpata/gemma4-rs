@@ -1,0 +1,44 @@
+//! Execution policies for Gemma 4's hybrid attention.
+//!
+//! `ContextMemory::view` currently exposes prefix slices, so callers fetch their
+//! available context and apply these ranges when creating attention inputs.
+
+use std::ops::Range;
+
+pub fn windowed_len(seq_len: usize, window: usize) -> Range<usize> {
+    seq_len.saturating_sub(window)..seq_len
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct LocalWindowPolicy {
+    window: usize,
+}
+
+impl LocalWindowPolicy {
+    pub const fn new(window: usize) -> Self {
+        Self { window }
+    }
+
+    pub fn range(self, seq_len: usize) -> Range<usize> {
+        windowed_len(seq_len, self.window)
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct GlobalPolicy;
+
+impl GlobalPolicy {
+    pub fn range(self, seq_len: usize) -> Range<usize> {
+        0..seq_len
+    }
+}
+
+/// Assigns layers to proportionally spaced KV-share groups.
+///
+/// For E2B, use `kv_slot(layer, 35, 20)`.
+pub fn kv_slot(layer: usize, n_layers: usize, n_slots: usize) -> usize {
+    assert!(n_layers > 0, "n_layers must be non-zero");
+    assert!(n_slots > 0, "n_slots must be non-zero");
+    assert!(layer < n_layers, "layer must be within n_layers");
+    layer * n_slots / n_layers
+}
