@@ -1,4 +1,4 @@
-use llm_backend_cpu::{buffer::F32Buf, port::CpuPort};
+use llm_backend_cpu::{buffer::F32Buf, ops::rms_norm_gemma_f32, port::CpuPort};
 use llm_eng::{
     compute::ComputePort,
     context_memory::{ContextMemory, KvCache},
@@ -32,6 +32,50 @@ impl HeadConfig {
         }
         Ok(d_model / self.n_heads)
     }
+
+    /// Reads Gemma's GQA layout from GGUF metadata, with the Gemma 256-wide
+    /// head convention as a fallback for old files that omit those keys.
+    pub fn from_gguf_metadata<R: std::io::Read + std::io::Seek>(
+        gguf: &llm_gguf::reader::GgufFile<R>,
+        d_model: usize,
+    ) -> Result<Self, EngError> {
+        let arch = gguf.metadata_str("general.architecture").unwrap_or("gemma4");
+        let key = |suffix: &str| format!("{arch}.{suffix}");
+        let n_heads = gguf
+            .metadata_usize(&key("attention.head_count"))
+            .or_else(|| infer_head_count(gguf, "blk.0.attn_q.weight", d_model));
+        let n_kv_heads = gguf
+            .metadata_usize(&key("attention.head_count_kv"))
+            .or_else(|| {
+                gguf.metadata_u32s(&key("attention.head_count_kv"))
+                    .and_then(|values| values.first().copied())
+                    .map(|value| value as usize)
+            })
+            .or_else(|| infer_head_count(gguf, "blk.0.attn_k.weight", d_model));
+        let heads = Self {
+            n_heads: n_heads.ok_or_else(|| EngError::Compute("missing Gemma attention head count".into()))?,
+            n_kv_heads: n_kv_heads
+                .ok_or_else(|| EngError::Compute("missing Gemma KV attention head count".into()))?,
+        };
+        heads.validate(d_model)?;
+        Ok(heads)
+    }
+}
+
+fn infer_head_count<R: std::io::Read + std::io::Seek>(
+    gguf: &llm_gguf::reader::GgufFile<R>,
+    tensor_name: &str,
+    d_model: usize,
+) -> Option<usize> {
+    let dimensions = gguf.tensor(tensor_name).ok()?.dimensions;
+    let output = dimensions
+        .iter()
+        .copied()
+        .find(|&dimension| dimension as usize != d_model)
+        .unwrap_or(d_model as u64) as usize;
+    // Gemma's published architectures use 256-wide attention heads. Tensor
+    // dimensions alone cannot uniquely determine head count without that convention.
+    output.checked_div(256).filter(|&count| count > 0)
 }
 
 #[derive(Default)]
@@ -168,7 +212,8 @@ where
         let kv_dim = self.heads.n_kv_heads * head_dim;
         let position = self.layer_position(op);
         let input = acts.get(x)?.clone();
-        let normalized = self.port.rms_norm(&input, &self.tensor(&format!("layers.{layer}.attn_norm"))?, EPS)?;
+        // Gemma RMSNorm uses its learned weights as a delta: effective scale is `1 + weight`.
+        let normalized = rms_norm_gemma_f32(&input, &self.tensor(&format!("layers.{layer}.attn_norm"))?, EPS)?;
         let mut q = self.project(normalized.as_slice(), &format!("layers.{layer}.q"), d)?;
         let mut k = self.project(normalized.as_slice(), &format!("layers.{layer}.k"), kv_dim)?;
         let v = self.project(normalized.as_slice(), &format!("layers.{layer}.v"), kv_dim)?;
@@ -205,7 +250,7 @@ where
         }
         let attention = self.project(&attended, &format!("layers.{layer}.o"), d)?;
         let residual = self.port.add(&input, &attention)?;
-        let ffn_input = self.port.rms_norm(&residual, &self.tensor(&format!("layers.{layer}.ffn_norm"))?, EPS)?;
+        let ffn_input = rms_norm_gemma_f32(&residual, &self.tensor(&format!("layers.{layer}.ffn_norm"))?, EPS)?;
         let gate = self.tensor(&format!("layers.{layer}.gate"))?;
         let d_ff = gate.len() / d;
         let gate = self.project(ffn_input.as_slice(), &format!("layers.{layer}.gate"), d_ff)?;
@@ -225,7 +270,7 @@ where
         Ok(acts.push(output))
     }
     fn logits<'a>(&mut self, _: &(), x: ActId, acts: &'a mut CpuActivations) -> Result<&'a [f32], EngError> {
-        let normalized = self.port.rms_norm(acts.get(x)?, &self.tensor("final_norm")?, EPS)?;
+        let normalized = rms_norm_gemma_f32(acts.get(x)?, &self.tensor("final_norm")?, EPS)?;
         let logits = self.project(normalized.as_slice(), "lm_head", self.hp.vocab_size)?;
         self.last_logits = logits.as_slice().to_vec();
         let logits = acts.push(logits);

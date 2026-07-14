@@ -53,6 +53,22 @@ pub fn rms_norm_f32(x: &F32Buf, weight: &F32Buf, eps: f32) -> Result<F32Buf, Eng
         .into())
 }
 
+/// Gemma stores RMSNorm weights as a delta, so the effective scale is `1 + weight`.
+pub fn rms_norm_gemma_f32(x: &F32Buf, weight: &F32Buf, eps: f32) -> Result<F32Buf, EngError> {
+    if x.len() != weight.len() || x.len() == 0 || eps < 0.0 {
+        return Err(compute_error("invalid RMS norm inputs"));
+    }
+
+    let mean_square = x.as_slice().iter().map(|value| value * value).sum::<f32>() / x.len() as f32;
+    let scale = (mean_square + eps).sqrt().recip();
+    Ok(x.as_slice()
+        .iter()
+        .zip(weight.as_slice())
+        .map(|(value, weight)| value * scale * (1.0 + weight))
+        .collect::<Vec<_>>()
+        .into())
+}
+
 pub fn softmax_f32(x: &F32Buf) -> Result<F32Buf, EngError> {
     let Some(&max) = x
         .as_slice()

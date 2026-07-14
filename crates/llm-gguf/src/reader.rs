@@ -54,6 +54,7 @@ enum MetadataValue {
     Strings(Vec<String>),
     F32s(Vec<f32>),
     I32s(Vec<i32>),
+    U32s(Vec<u32>),
     Array,
 }
 
@@ -199,6 +200,13 @@ impl<R: Read + Seek> GgufFile<R> {
         }
     }
 
+    pub fn metadata_u32s(&self, key: &str) -> Option<&[u32]> {
+        match self.metadata.get(key) {
+            Some(MetadataValue::U32s(values)) => Some(values),
+            _ => None,
+        }
+    }
+
     pub fn tensor_names(&self) -> Vec<&str> {
         self.tensor_order.iter().map(String::as_str).collect()
     }
@@ -272,6 +280,10 @@ fn read_metadata_array<R: Read>(
     count: u64,
 ) -> Result<MetadataValue, GgufError> {
     match element_ty {
+        4 => (0..count)
+            .map(|_| read_u32(reader))
+            .collect::<Result<Vec<_>, _>>()
+            .map(MetadataValue::U32s),
         5 => (0..count)
             .map(|_| read_i32(reader))
             .collect::<Result<Vec<_>, _>>()

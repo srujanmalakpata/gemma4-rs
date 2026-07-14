@@ -9,3 +9,10 @@ name = "llm-cli"
 path = "src/main.rs"
 
 [dependencies]
+anyhow.workspace = true
+clap.workspace = true
+llm-eng.workspace = true
+llm-gemma4.workspace = true
+llm-gguf.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true

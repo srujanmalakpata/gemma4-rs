@@ -54,6 +54,7 @@ impl Gemma4HyperParams {
             d_model: gguf.metadata_usize(&key("embedding_length")).unwrap_or(defaults.d_model),
             vocab_size: gguf.metadata_strings("tokenizer.ggml.tokens").map_or(defaults.vocab_size, <[String]>::len),
             sliding_window: gguf.metadata_usize(&key("sliding_window")).unwrap_or(defaults.sliding_window),
+            kv_slots: gguf.metadata_usize(&key("shared_kv_layers")).unwrap_or(defaults.kv_slots),
             ..defaults
         }
     }
