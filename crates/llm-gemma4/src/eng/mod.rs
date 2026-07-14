@@ -33,12 +33,39 @@ impl GlobalPolicy {
     }
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum KvSlotError {
+    ZeroLayers,
+    ZeroSlots,
+    LayerOutOfRange { layer: usize, n_layers: usize },
+}
+
+impl std::fmt::Display for KvSlotError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::ZeroLayers => write!(f, "n_layers must be non-zero"),
+            Self::ZeroSlots => write!(f, "n_slots must be non-zero"),
+            Self::LayerOutOfRange { layer, n_layers } => {
+                write!(f, "layer {layer} must be within n_layers {n_layers}")
+            }
+        }
+    }
+}
+
+impl std::error::Error for KvSlotError {}
+
 /// Assigns layers to proportionally spaced KV-share groups.
 ///
 /// For E2B, use `kv_slot(layer, 35, 20)`.
-pub fn kv_slot(layer: usize, n_layers: usize, n_slots: usize) -> usize {
-    assert!(n_layers > 0, "n_layers must be non-zero");
-    assert!(n_slots > 0, "n_slots must be non-zero");
-    assert!(layer < n_layers, "layer must be within n_layers");
-    layer * n_slots / n_layers
+pub fn kv_slot(layer: usize, n_layers: usize, n_slots: usize) -> Result<usize, KvSlotError> {
+    if n_layers == 0 {
+        return Err(KvSlotError::ZeroLayers);
+    }
+    if n_slots == 0 {
+        return Err(KvSlotError::ZeroSlots);
+    }
+    if layer >= n_layers {
+        return Err(KvSlotError::LayerOutOfRange { layer, n_layers });
+    }
+    Ok(layer * n_slots / n_layers)
 }
