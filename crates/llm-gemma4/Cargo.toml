@@ -10,4 +10,5 @@ llm-backend-cpu.workspace = true
 llm-eng.workspace = true
 llm-gguf.workspace = true
 llm-idea.workspace = true
+rand.workspace = true
 thiserror.workspace = true

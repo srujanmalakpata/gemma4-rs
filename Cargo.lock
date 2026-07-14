@@ -93,6 +93,7 @@ dependencies = [
  "llm-eng",
  "llm-gguf",
  "llm-idea",
+ "rand",
  "thiserror",
 ]
 
