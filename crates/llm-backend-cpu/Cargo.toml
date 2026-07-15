@@ -1,0 +1,10 @@
+[package]
+name = "llm-backend-cpu"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+half.workspace = true
+llm-eng.workspace = true
+thiserror.workspace = true

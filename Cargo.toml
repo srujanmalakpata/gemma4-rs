@@ -1,0 +1,29 @@
+[workspace]
+resolver = "2"
+members = [
+  "crates/llm-idea",
+  "crates/llm-eng",
+  "crates/llm-gguf",
+  "crates/llm-backend-cpu",
+  "crates/llm-gemma4",
+  "crates/llm-cli",
+]
+
+[workspace.package]
+edition = "2021"
+license = "MIT"
+version = "0.1.0"
+
+[workspace.dependencies]
+llm-idea = { path = "crates/llm-idea" }
+llm-eng = { path = "crates/llm-eng" }
+llm-gguf = { path = "crates/llm-gguf" }
+llm-backend-cpu = { path = "crates/llm-backend-cpu" }
+llm-gemma4 = { path = "crates/llm-gemma4" }
+thiserror = "2"
+rand = "0.10.2"
+anyhow = "1"
+half = "2"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+clap = { version = "4", features = ["derive"] }
