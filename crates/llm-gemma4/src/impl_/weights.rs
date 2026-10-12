@@ -1,7 +1,6 @@
 use std::path::Path;
 
 use half::f16;
-use llm_backend_cpu::dequant::dequant_q8_0;
 use llm_eng::weight_store::{TensorBlob, WeightStore};
 use llm_gguf::{
     reader::{GgufError, GgufFile},
@@ -15,13 +14,13 @@ pub enum WeightLoadError {
     Gguf(#[from] GgufError),
     #[error("expected a Gemma 4 GGUF, but `general.architecture` was {found:?}")]
     WrongArchitecture { found: Option<String> },
-    #[error("cannot dequantize tensor `{name}`: {reason}")]
-    Dequantization { name: String, reason: String },
     #[error("unsupported tensor type for `{name}`")]
     UnsupportedTensor { name: String },
 }
 
-/// Loads text-model tensors into RAM. Multimodal tensors are deliberately ignored.
+/// Loads text-model tensors into RAM in their stored formats: Q8_0 and BF16
+/// matrices stay quantized, F32 and F16 tensors become f32. Multimodal
+/// tensors are deliberately ignored.
 pub fn load_gemma4_e2b(path: impl AsRef<Path>) -> Result<WeightStore, WeightLoadError> {
     let mut gguf = GgufFile::open_path(path)?;
     let architecture = gguf.metadata_str("general.architecture").map(str::to_owned);
@@ -44,31 +43,38 @@ pub fn load_gemma4_e2b(path: impl AsRef<Path>) -> Result<WeightStore, WeightLoad
         if is_multimodal_tensor(&name) {
             continue;
         }
-        let ty = gguf.tensor(&name)?.ty;
+        let info = gguf.tensor(&name)?;
+        let ty = info.ty;
+        // GGUF lists the fastest-varying dimension first: `[ncols, nrows, ...]`.
+        let ncols = info.dimensions.first().copied().unwrap_or(1) as usize;
+        let nrows = info.numel() / ncols.max(1);
         let bytes = gguf.read_tensor_bytes(&name)?;
-        let values = match ty {
-            TensorType::F32 => bytes
-                .chunks_exact(4)
-                .map(|bytes| f32::from_le_bytes(bytes.try_into().expect("exact chunk size")))
-                .collect(),
-            TensorType::F16 => bytes
-                .chunks_exact(2)
-                .map(|bytes| {
-                    f16::from_le_bytes(bytes.try_into().expect("exact chunk size")).to_f32()
-                })
-                .collect(),
-            TensorType::BF16 => bytes
-                .chunks_exact(2)
-                .map(|bytes| f32::from_bits(u32::from(u16::from_le_bytes([bytes[0], bytes[1]])) << 16))
-                .collect(),
-            TensorType::Q8_0 => {
-                dequant_q8_0(&bytes).map_err(|error| WeightLoadError::Dequantization {
-                    name: name.clone(),
-                    reason: error.to_string(),
-                })?
-            }
+        let blob = match ty {
+            TensorType::F32 => TensorBlob::F32(
+                bytes
+                    .chunks_exact(4)
+                    .map(|bytes| f32::from_le_bytes(bytes.try_into().expect("exact chunk size")))
+                    .collect(),
+            ),
+            TensorType::F16 => TensorBlob::F32(
+                bytes
+                    .chunks_exact(2)
+                    .map(|bytes| {
+                        f16::from_le_bytes(bytes.try_into().expect("exact chunk size")).to_f32()
+                    })
+                    .collect(),
+            ),
+            TensorType::BF16 => TensorBlob::Bf16 {
+                data: bytes
+                    .chunks_exact(2)
+                    .map(|bytes| u16::from_le_bytes([bytes[0], bytes[1]]))
+                    .collect(),
+                nrows,
+                ncols,
+            },
+            TensorType::Q8_0 => TensorBlob::Q8 { data: bytes, nrows, ncols },
         };
-        weights.insert(name, TensorBlob::F32(values));
+        weights.insert(name, blob);
     }
     Ok(weights)
 }

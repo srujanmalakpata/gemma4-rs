@@ -1,4 +1,10 @@
-use llm_backend_cpu::{buffer::F32Buf, ops::rms_norm_gemma_f32, port::CpuPort};
+use llm_backend_cpu::{
+    buffer::F32Buf,
+    dequant::dequant_q8_0,
+    matvec::{matvec_bf16, matvec_f32, matvec_q8_0, quantize_q8_0, Q8_0_BLOCK_BYTES, Q8_0_BLOCK_VALUES},
+    ops::rms_norm_gemma_f32,
+    port::CpuPort,
+};
 use llm_eng::{
     compute::ComputePort,
     context_memory::{ContextMemory, KvCache},
@@ -173,19 +179,59 @@ where
             }
         }
     }
-    /// Borrows a weight; weights can be gigabytes, so they are never copied.
+    /// Borrows a weight in its stored format; weights can be gigabytes, so
+    /// they are never copied.
+    fn blob(&self, name: &str) -> Result<&TensorBlob, EngError> {
+        Self::names(name)
+            .iter()
+            .find_map(|candidate| self.weights.get(candidate).ok())
+            .ok_or_else(|| EngError::MissingWeight(name.into()))
+    }
+    /// Borrows an f32 weight (norm scales and synthetic test weights).
     fn tensor(&self, name: &str) -> Result<&[f32], EngError> {
-        for candidate in Self::names(name) {
-            if let Ok(TensorBlob::F32(values)) = self.weights.get(&candidate) { return Ok(values); }
+        match self.blob(name)? {
+            TensorBlob::F32(values) => Ok(values),
+            _ => Err(EngError::Compute(format!("weight `{name}` is not stored as f32"))),
         }
-        Err(EngError::MissingWeight(name.into()))
     }
     fn optional_tensor(&self, name: &str) -> Option<&[f32]> { self.tensor(name).ok() }
-    /// GGUF linear tensors are row-major `[out, in]`; this computes `x @ Wᵀ`.
+    /// Number of output rows of a linear weight.
+    fn rows(&self, name: &str, cols: usize) -> Result<usize, EngError> {
+        Ok(match self.blob(name)? {
+            TensorBlob::F32(values) => values.len() / cols,
+            TensorBlob::Q8 { nrows, .. } | TensorBlob::Bf16 { nrows, .. } => *nrows,
+        })
+    }
+    /// One row of a matrix as f32, e.g. a token's embedding.
+    fn row(&self, name: &str, index: usize, cols: usize) -> Result<Vec<f32>, EngError> {
+        match self.blob(name)? {
+            TensorBlob::F32(values) => values
+                .get(index * cols..(index + 1) * cols)
+                .map(<[f32]>::to_vec)
+                .ok_or_else(|| EngError::Compute(format!("row {index} is outside `{name}`"))),
+            TensorBlob::Q8 { data, nrows, ncols } if *ncols == cols && index < *nrows => {
+                let row_bytes = cols / Q8_0_BLOCK_VALUES * Q8_0_BLOCK_BYTES;
+                dequant_q8_0(&data[index * row_bytes..(index + 1) * row_bytes])
+                    .map_err(|error| EngError::Compute(error.to_string()))
+            }
+            _ => Err(EngError::Compute(format!("cannot read row {index} of `{name}`"))),
+        }
+    }
+    /// GGUF linear tensors are row-major `[out, in]`; this computes `W @ x`.
     fn project(&self, x: &[f32], name: &str, out: usize) -> Result<F32Buf, EngError> {
-        let w = self.tensor(name)?;
-        if w.len() != x.len() * out { return Err(EngError::Compute(format!("weight `{name}` has {}, expected {}x{}", w.len(), out, x.len()))); }
-        Ok(w.chunks_exact(x.len()).map(|row| row.iter().zip(x).map(|(a, b)| a * b).sum()).collect::<Vec<f32>>().into())
+        let shape_error = || EngError::Compute(format!("weight `{name}` is not {out}x{}", x.len()));
+        let values = match self.blob(name)? {
+            TensorBlob::F32(w) => matvec_f32(w, out, x).map_err(|_| shape_error())?,
+            TensorBlob::Q8 { data, nrows, ncols } => {
+                if (*nrows, *ncols) != (out, x.len()) { return Err(shape_error()); }
+                matvec_q8_0(data, out, &quantize_q8_0(x)?)?
+            }
+            TensorBlob::Bf16 { data, nrows, ncols } => {
+                if (*nrows, *ncols) != (out, x.len()) { return Err(shape_error()); }
+                matvec_bf16(data, out, x)?
+            }
+        };
+        Ok(values.into())
     }
     fn layer_position(&self, op: LayerOp) -> usize { match op { LayerOp::Prefill => self.prefill_position, LayerOp::Decode { position } => position } }
 }
@@ -202,9 +248,8 @@ where
         let token = tokens.last().ok_or_else(|| EngError::Msg("cannot embed an empty token sequence".into()))?.0 as usize;
         if token >= self.hp.vocab_size { return Err(EngError::Compute(format!("token {token} exceeds vocabulary"))); }
         self.current_token = Some(token);
-        let table = self.tensor("tok_embeddings")?;
-        let d = self.hp.d_model;
-        Ok(acts.push(table[token * d..(token + 1) * d].to_vec().into()))
+        let embedding = self.row("tok_embeddings", token, self.hp.d_model)?;
+        Ok(acts.push(embedding.into()))
     }
     fn layer_count(&self, _: &()) -> usize { self.hp.n_layers }
     fn layer(&mut self, _: &(), layer: usize, x: ActId, acts: &mut CpuActivations, op: LayerOp) -> Result<ActId, EngError> {
@@ -252,7 +297,7 @@ where
         let attention = self.project(&attended, &format!("layers.{layer}.o"), d)?;
         let residual = self.port.add(&input, &attention)?;
         let ffn_input = rms_norm_gemma_f32(&residual, self.tensor(&format!("layers.{layer}.ffn_norm"))?, EPS)?;
-        let d_ff = self.tensor(&format!("layers.{layer}.gate"))?.len() / d;
+        let d_ff = self.rows(&format!("layers.{layer}.gate"), d)?;
         let gate = self.project(ffn_input.as_slice(), &format!("layers.{layer}.gate"), d_ff)?;
         let up = self.project(ffn_input.as_slice(), &format!("layers.{layer}.up"), d_ff)?;
         let gated: Vec<f32> = gate.as_slice().iter().zip(up.as_slice()).map(|(&g, &u)| g / (1.0 + (-g).exp()) * u).collect();
