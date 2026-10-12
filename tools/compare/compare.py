@@ -2,18 +2,30 @@
 """Compare this engine with llama.cpp on the same Gemma 4 E2B GGUF.
 
 Runs `llama_dump` (tools/compare/llama_dump.cpp, built against llama.cpp) and
-`llm-dump` (this repo) on the same inputs and checks:
+`llm-dump` (this repo) on the same inputs:
 
-1. Tokenizer: identical token ids for every string in TOKENIZER_CASES.
-2. Logits: for every prompt in LOGIT_PROMPTS, both run the *same* token ids
-   (llama.cpp's) and every position's logits are compared against the
-   tolerances below.
+1. Tokenizer: identical token ids for every string in TOKENIZER_CASES
+   (pass/fail).
+2. Reference check (pass/fail): for every prompt in LOGIT_PROMPTS, llama.cpp
+   runs a copy of the model with all weights stored as F32 (made with
+   `llama-quantize --allow-requantize ... F32`, which dequantizes Q8_0 and
+   BF16 exactly), and the engine runs the Q8_0 file with f32 activations and
+   ggml's fp16 GELU table. Neither side rounds activations to 8 bits, so the
+   logits should agree to float rounding; they are compared against the
+   REFERENCE_* tolerances.
+3. Default arithmetic (informational): llama.cpp on the Q8_0 file and the
+   engine with its default settings both quantize activations to Q8_0 before
+   each Q8_0 mat-vec. Gemma 4's activations have outliers, so tiny
+   differences flip some 8-bit roundings and grow through the layers; this
+   section reports how far apart that leaves the two, and how far each is
+   from the F32 reference.
 
-Writes a Markdown report (default tools/compare/RESULTS.md) and exits non-zero
-if any check fails. Standard library only.
+All logit runs use llama.cpp's token ids, so the model math is compared on
+identical input. Writes a Markdown report (default tools/compare/RESULTS.md)
+and exits non-zero if a pass/fail check fails. Standard library only.
 
-    python3 tools/compare/compare.py --model MODEL.gguf \
-        --llama-dump PATH/TO/llama_dump [--engine-dump target/release/llm-dump]
+    python3 tools/compare/compare.py --model E2B-Q8_0.gguf \\
+        --reference-model E2B-F32.gguf --llama-dump PATH/TO/llama_dump
 """
 
 import argparse
@@ -26,14 +38,13 @@ import sys
 import tempfile
 import time
 
-# Tolerances, fixed before the first real-model run. Logits are post-softcap
-# (|logit| <= 30). They allow for llama.cpp's own approximations (GELU via an
-# fp16 lookup table, bf16-rounded activations for the BF16 tensor) and for
-# float summation order; anything structural (a wrong norm, RoPE layout,
-# mask) shows up as differences of whole logits and wrong top-1 tokens.
-MAX_ABS_DIFF = 0.25  # largest |engine - llama.cpp| over all positions and vocab
-MEAN_ABS_DIFF = 0.02  # mean |difference| over all positions and vocab
-TOP1_AGREEMENT = 1.0  # fraction of positions whose argmax token matches
+# Reference-check tolerances, fixed before the check's first run. Logits are
+# post-softcap (|logit| <= 30). With no 8-bit activation rounding on either
+# side, what is left is float summation order, libm differences and the
+# occasional fp16 rounding flip inside the GELU table.
+REFERENCE_MAX_ABS_DIFF = 0.05  # largest |engine - llama.cpp| over all positions and vocab
+REFERENCE_MEAN_ABS_DIFF = 0.002  # mean |difference| over all positions and vocab
+REFERENCE_TOP1_AGREEMENT = 1.0  # fraction of positions whose argmax token matches
 
 TOKENIZER_CASES = [
     "Hello",
@@ -109,53 +120,84 @@ def compare_tokenizer(args, work):
     return rows
 
 
-def logit_stats(expected, actual, n_tokens):
+def log_softmax(row):
+    top = max(row)
+    log_total = math.log(math.fsum(math.exp(x - top) for x in row)) + top
+    return [x - log_total for x in row]
+
+
+def compare_rows(expected, actual, n_tokens):
+    """Logit statistics over all positions; `expected` is the baseline."""
     n_vocab = len(expected) // n_tokens
-    max_abs, total_abs, top1_same, worst_margin = 0.0, 0.0, 0, math.inf
+    max_abs, total_abs, top1_same, kls = 0.0, 0.0, 0, []
     for position in range(n_tokens):
         row = slice(position * n_vocab, (position + 1) * n_vocab)
         e, a = expected[row], actual[row]
         diffs = [abs(x - y) for x, y in zip(e, a)]
         max_abs = max(max_abs, max(diffs))
-        total_abs += sum(diffs)
-        e_top = max(range(n_vocab), key=e.__getitem__)
-        a_top = max(range(n_vocab), key=a.__getitem__)
-        top1_same += e_top == a_top
-        if e_top != a_top:
-            ranked = sorted(e, reverse=True)
-            worst_margin = min(worst_margin, ranked[0] - ranked[1])
+        total_abs += math.fsum(diffs)
+        top1_same += max(range(n_vocab), key=e.__getitem__) == max(range(n_vocab), key=a.__getitem__)
+        log_p, log_q = log_softmax(e), log_softmax(a)
+        kls.append(math.fsum(math.exp(p) * (p - q) for p, q in zip(log_p, log_q)))
     return {
-        "n_tokens": n_tokens,
         "max_abs": max_abs,
         "mean_abs": total_abs / (n_tokens * n_vocab),
-        "top1": top1_same / n_tokens,
-        "worst_margin": worst_margin,
+        "top1": top1_same,
+        "kl_mean": sum(kls) / n_tokens,
+        "kl_max": max(kls),
     }
 
 
 def compare_logits(args, work):
     rows = []
     for index, text in enumerate(LOGIT_PROMPTS):
-        ref = os.path.join(work, f"logit{index}-llama")
-        eng = os.path.join(work, f"logit{index}-engine")
-        ref_seconds = dump(args.llama_dump, args.model, text, ref, [str(args.threads)])
-        eng_seconds = dump(
-            args.engine_dump, args.model, text, eng, ["--token-file", ref + ".tokens"]
+        prefix = os.path.join(work, f"logit{index}")
+        timing = {}
+        timing["llama_q8"] = dump(args.llama_dump, args.model, text, prefix + "-llama-q8", [str(args.threads)])
+        tokens_file = prefix + "-llama-q8.tokens"
+        timing["llama_f32"] = dump(
+            args.llama_dump, args.reference_model, text, prefix + "-llama-f32", [str(args.threads)]
         )
-        tokens = read_u32(ref + ".tokens")
-        stats = logit_stats(read_f32(ref + ".logits"), read_f32(eng + ".logits"), len(tokens))
-        stats.update(text=text, ref_seconds=ref_seconds, eng_seconds=eng_seconds)
-        stats["pass"] = (
-            stats["max_abs"] <= MAX_ABS_DIFF
-            and stats["mean_abs"] <= MEAN_ABS_DIFF
-            and stats["top1"] >= TOP1_AGREEMENT
+        if read_u32(prefix + "-llama-f32.tokens") != read_u32(tokens_file):
+            sys.exit(f"the two llama.cpp runs tokenized prompt {index} differently")
+        timing["engine_default"] = dump(
+            args.engine_dump, args.model, text, prefix + "-engine-default", ["--token-file", tokens_file]
         )
-        rows.append(stats)
+        timing["engine_reference"] = dump(
+            args.engine_dump,
+            args.model,
+            text,
+            prefix + "-engine-reference",
+            ["--token-file", tokens_file, "--f32-activations", "--fp16-gelu"],
+        )
+        n_tokens = len(read_u32(tokens_file))
+        logits = {name: read_f32(f"{prefix}-{name.replace('_', '-')}.logits") for name in timing}
+        reference = compare_rows(logits["llama_f32"], logits["engine_reference"], n_tokens)
+        reference["pass"] = (
+            reference["max_abs"] <= REFERENCE_MAX_ABS_DIFF
+            and reference["mean_abs"] <= REFERENCE_MEAN_ABS_DIFF
+            and reference["top1"] >= REFERENCE_TOP1_AGREEMENT * n_tokens
+        )
+        rows.append(
+            {
+                "text": text,
+                "n_tokens": n_tokens,
+                "timing": timing,
+                "reference": reference,
+                "engine_vs_llama_q8": compare_rows(logits["llama_q8"], logits["engine_default"], n_tokens),
+                "llama_q8_vs_f32": compare_rows(logits["llama_f32"], logits["llama_q8"], n_tokens),
+                "engine_vs_f32": compare_rows(logits["llama_f32"], logits["engine_default"], n_tokens),
+            }
+        )
     return rows
 
 
 def show(text):
     return text.replace("\\", "\\\\").replace("\n", "\\n").replace("\t", "\\t").replace("|", "\\|")
+
+
+def short(text):
+    return show(text[len("<|turn>user\n"):].split("<turn|>")[0]) if text.startswith("<|turn>user\n") else show(text)
 
 
 def report(args, tokenizer_rows, logit_rows):
@@ -179,31 +221,74 @@ def report(args, tokenizer_rows, logit_rows):
         shown = show(text if len(text) <= 60 else text[:57] + "...")
         detail = "yes" if same else f"**no**: llama.cpp {expected}, engine {actual}"
         lines.append(f"| `{shown}` | {len(expected)} | {detail} |")
-    if logit_rows:
-        lines += [
-            "",
-            "## Logits",
-            "",
-            "Both sides run llama.cpp's token ids for each prompt (BOS plus the chat-formatted",
-            "text) and every position's full 262,144-entry logit row is compared.",
-            "",
-            f"Tolerances: max |diff| <= {MAX_ABS_DIFF}, mean |diff| <= {MEAN_ABS_DIFF},",
-            f"top-1 token agreement >= {TOP1_AGREEMENT:.0%} of positions.",
-            "",
-            "| Prompt | Positions | Max abs diff | Mean abs diff | Top-1 agree | llama.cpp s | Engine s | Pass |",
-            "|---|---:|---:|---:|---:|---:|---:|---|",
-        ]
-        for r in logit_rows:
-            lines.append(
-                f"| `{show(r['text'])}` | {r['n_tokens']} | {r['max_abs']:.4f} | {r['mean_abs']:.5f} "
-                f"| {r['top1']:.0%} | {r['ref_seconds']:.1f} | {r['eng_seconds']:.1f} "
-                f"| {'yes' if r['pass'] else '**no**'} |"
-            )
-        lines += [
-            "",
-            "Times are wall-clock for a whole run of each tool (load plus all positions), not a",
-            "benchmark.",
-        ]
+    if not logit_rows:
+        return "\n".join(lines) + "\n"
+
+    positions = sum(r["n_tokens"] for r in logit_rows)
+    lines += [
+        "",
+        "## Logits: reference check (pass/fail)",
+        "",
+        f"`{os.path.basename(args.reference_model)}` holds the same weights stored as F32.",
+        "llama.cpp runs it; the engine runs the Q8_0 file with `--f32-activations --fp16-gelu`.",
+        "Neither side rounds activations to 8 bits. Each prompt is the chat-formatted user",
+        "message below plus BOS, and all 262,144 logits at every position are compared.",
+        "",
+        f"Tolerances: max |diff| <= {REFERENCE_MAX_ABS_DIFF}, mean |diff| <= {REFERENCE_MEAN_ABS_DIFF},",
+        f"same top-1 token at {REFERENCE_TOP1_AGREEMENT:.0%} of positions.",
+        "",
+        "| User message | Positions | Max abs diff | Mean abs diff | Top-1 same | Mean KL | Pass |",
+        "|---|---:|---:|---:|---:|---:|---|",
+    ]
+    for r in logit_rows:
+        s = r["reference"]
+        lines.append(
+            f"| `{short(r['text'])}` | {r['n_tokens']} | {s['max_abs']:.4f} | {s['mean_abs']:.5f} "
+            f"| {s['top1']}/{r['n_tokens']} | {s['kl_mean']:.1e} | {'yes' if s['pass'] else '**no**'} |"
+        )
+    lines += [
+        "",
+        "## Logits: default arithmetic (informational)",
+        "",
+        "Both engines' normal settings quantize activations to Q8_0 before every Q8_0",
+        "mat-vec. Gemma 4's normalized activations have outliers (norm weights reach 123), so",
+        "a block's single 8-bit scale is large and a tiny upstream difference flips some",
+        "roundings; these differences grow through 35 layers. KL divergence (nats, from the",
+        "first-named run's distribution) measures the effect on next-token probabilities and,",
+        f"unlike raw logit differences, ignores uniform shifts. Totals over {positions} positions:",
+        "",
+        "| Comparison | Top-1 same | Mean KL | Max KL | Mean abs diff |",
+        "|---|---:|---:|---:|---:|",
+    ]
+    for key, label in [
+        ("engine_vs_llama_q8", "llama.cpp Q8_0 vs engine default"),
+        ("llama_q8_vs_f32", "llama.cpp F32 weights vs llama.cpp Q8_0"),
+        ("engine_vs_f32", "llama.cpp F32 weights vs engine default"),
+    ]:
+        stats = [r[key] for r in logit_rows]
+        top1 = sum(s["top1"] for s in stats)
+        kl_mean = sum(s["kl_mean"] * r["n_tokens"] for s, r in zip(stats, logit_rows)) / positions
+        mean_abs = sum(s["mean_abs"] * r["n_tokens"] for s, r in zip(stats, logit_rows)) / positions
+        lines.append(
+            f"| {label} | {top1}/{positions} | {kl_mean:.1e} | {max(s['kl_max'] for s in stats):.1e} "
+            f"| {mean_abs:.3f} |"
+        )
+    lines += [
+        "",
+        "## Run times",
+        "",
+        "Wall-clock seconds for one whole run of each tool (load plus every position, one",
+        "token at a time for the engine), not a benchmark.",
+        "",
+        "| User message | llama.cpp Q8_0 | llama.cpp F32 | Engine default | Engine reference |",
+        "|---|---:|---:|---:|---:|",
+    ]
+    for r in logit_rows:
+        t = r["timing"]
+        lines.append(
+            f"| `{short(r['text'])}` | {t['llama_q8']:.1f} | {t['llama_f32']:.1f} "
+            f"| {t['engine_default']:.1f} | {t['engine_reference']:.1f} |"
+        )
     return "\n".join(lines) + "\n"
 
 
@@ -211,7 +296,8 @@ def main():
     here = os.path.dirname(os.path.abspath(__file__))
     root = os.path.dirname(os.path.dirname(here))
     parser = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
-    parser.add_argument("--model", required=True)
+    parser.add_argument("--model", required=True, help="Q8_0 GGUF")
+    parser.add_argument("--reference-model", help="the same model with F32 weights (needed for logits)")
     parser.add_argument("--llama-dump", required=True)
     parser.add_argument("--llama-version", default="unknown", help="llama.cpp tag, for the report")
     parser.add_argument("--engine-dump", default=os.path.join(root, "target", "release", "llm-dump"))
@@ -219,6 +305,8 @@ def main():
     parser.add_argument("--report", default=os.path.join(here, "RESULTS.md"))
     parser.add_argument("--skip-logits", action="store_true")
     args = parser.parse_args()
+    if not args.skip_logits and not args.reference_model:
+        parser.error("--reference-model is required unless --skip-logits is given")
 
     with tempfile.TemporaryDirectory() as work:
         tokenizer_rows = compare_tokenizer(args, work)
@@ -226,7 +314,7 @@ def main():
 
     with open(args.report, "w", encoding="utf-8") as f:
         f.write(report(args, tokenizer_rows, logit_rows))
-    failures = sum(not r[3] for r in tokenizer_rows) + sum(not r["pass"] for r in logit_rows)
+    failures = sum(not r[3] for r in tokenizer_rows) + sum(not r["reference"]["pass"] for r in logit_rows)
     print(f"wrote {args.report}; {failures} failing checks")
     sys.exit(1 if failures else 0)
 
