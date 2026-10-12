@@ -53,12 +53,12 @@ same run also passes. The "Fixed" column shows the original verdict.
 
 | User message | Tokens | Compared | Max abs diff | Floor max | Mean abs diff | Floor mean | Top-1 same | Mean KL | Fixed | Pass |
 |---|---:|---:|---:|---:|---:|---:|---:|---:|---|---|
-| `What is the capital of France?` | 16 | 16 | 0.0494 | 0.0415 | 0.00433 | 0.00382 | 16/16 | 2.2e-06 | no | yes |
-| `Write a haiku about autumn leaves.` | 17 | 17 | 0.0381 | 0.1243 | 0.00419 | 0.00789 | 17/17 | 1.2e-06 | no | yes |
-| `Explain in one sentence why the sky is blue.` | 19 | 19 | 0.0327 | 0.0427 | 0.00365 | 0.00399 | 19/19 | 6.1e-07 | no | yes |
-| `Translate to French: The cat sleeps on the warm windowsill.` | 21 | 21 | 0.0300 | 0.0313 | 0.00354 | 0.00354 | 21/21 | 1.9e-06 | no | yes |
-| `def fibonacci(n):\n    # complete this Python function` | 22 | 22 | 0.0286 | 0.0265 | 0.00400 | 0.00356 | 22/22 | 1.4e-06 | no | yes |
-| `Read this passage, then say in one sentence why the wells failed.\n\n<long_passage.txt, 514 words>` | 628 | 24 | 0.0458 | 0.0178 | 0.00334 | 0.00239 | 24/24 | 4.9e-07 | no | yes |
+| `What is the capital of France?` | 16 | 16 | 0.0360 | 0.0373 | 0.00352 | 0.00359 | 16/16 | 1.4e-06 | no | yes |
+| `Write a haiku about autumn leaves.` | 17 | 17 | 0.0390 | 0.0624 | 0.00395 | 0.00536 | 17/17 | 8.0e-07 | no | yes |
+| `Explain in one sentence why the sky is blue.` | 19 | 19 | 0.0228 | 0.0306 | 0.00302 | 0.00369 | 19/19 | 5.8e-07 | no | yes |
+| `Translate to French: The cat sleeps on the warm windowsill.` | 21 | 21 | 0.0331 | 0.0254 | 0.00328 | 0.00289 | 21/21 | 1.2e-06 | no | yes |
+| `def fibonacci(n):\n    # complete this Python function` | 22 | 22 | 0.0252 | 0.0258 | 0.00383 | 0.00358 | 22/22 | 7.9e-07 | no | yes |
+| `Read this passage, then say in one sentence why the wells failed.\n\n<long_passage.txt, 514 words>` | 628 | 24 | 0.0238 | 0.0158 | 0.00277 | 0.00217 | 24/24 | 4.3e-07 | no | yes |
 
 ## Logits: default arithmetic (informational)
 
@@ -71,9 +71,9 @@ unlike raw logit differences, ignores uniform shifts. Totals over 119 positions:
 
 | Comparison | Top-1 same | Mean KL | Max KL | Mean abs diff |
 |---|---:|---:|---:|---:|
-| llama.cpp Q8_0 vs engine default | 118/119 | 5.6e-03 | 8.8e-02 | 0.239 |
+| llama.cpp Q8_0 vs engine default | 116/119 | 5.9e-03 | 6.3e-02 | 0.284 |
 | llama.cpp F32 weights vs llama.cpp Q8_0 | 118/119 | 7.4e-03 | 8.4e-02 | 0.259 |
-| llama.cpp F32 weights vs engine default | 119/119 | 6.9e-03 | 7.1e-02 | 0.270 |
+| llama.cpp F32 weights vs engine default | 117/119 | 7.7e-03 | 5.5e-02 | 0.294 |
 
 ## Run times
 
@@ -82,9 +82,9 @@ token at a time for the engine), not a benchmark.
 
 | User message | llama.cpp Q8_0 | llama.cpp F32 | Engine default | Engine reference | Engine f64 sums |
 |---|---:|---:|---:|---:|---:|
-| `What is the capital of France?` | 1.4 | 7.6 | 3.3 | 5.2 | 4.6 |
-| `Write a haiku about autumn leaves.` | 1.8 | 10.4 | 3.5 | 5.9 | 4.7 |
-| `Explain in one sentence why the sky is blue.` | 2.0 | 10.7 | 3.5 | 6.0 | 5.1 |
-| `Translate to French: The cat sleeps on the warm windowsill.` | 2.2 | 10.7 | 3.5 | 6.9 | 5.5 |
-| `def fibonacci(n):\n    # complete this Python function` | 2.5 | 10.7 | 3.7 | 7.1 | 6.3 |
-| `Read this passage, then say in one sentence why the wells failed.\n\n<long_passage.txt, 514 words>` | 7.5 | 36.7 | 46.0 | 159.0 | 132.9 |
+| `What is the capital of France?` | 2.6 | 11.4 | 3.7 | 7.4 | 5.7 |
+| `Write a haiku about autumn leaves.` | 5.0 | 10.7 | 3.5 | 8.5 | 7.6 |
+| `Explain in one sentence why the sky is blue.` | 4.5 | 10.9 | 4.0 | 7.9 | 6.3 |
+| `Translate to French: The cat sleeps on the warm windowsill.` | 5.7 | 11.1 | 3.7 | 8.5 | 6.7 |
+| `def fibonacci(n):\n    # complete this Python function` | 3.3 | 10.9 | 4.3 | 9.7 | 7.2 |
+| `Read this passage, then say in one sentence why the wells failed.\n\n<long_passage.txt, 514 words>` | 10.2 | 38.4 | 41.0 | 155.6 | 122.9 |
