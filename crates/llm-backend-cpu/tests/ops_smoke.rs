@@ -2,7 +2,7 @@ use half::f16;
 use llm_backend_cpu::buffer::F32Buf;
 use llm_backend_cpu::dequant::dequant_q8_0;
 use llm_backend_cpu::ops::{
-    add_f32, matmul_f32, rms_norm_f32, rms_norm_gemma_f32, rope_f32, softmax_f32,
+    add_f32, matmul_f32, rms_norm, rms_norm_f32, rope_f32, softmax_f32,
 };
 use llm_backend_cpu::port::CpuPort;
 use llm_eng::compute::ComputePort;
@@ -44,12 +44,14 @@ fn rms_norm_scales_unit_vector() {
 }
 
 #[test]
-fn gemma_rms_norm_adds_one_to_weights() {
-    let x = F32Buf::from(vec![3.0, 4.0]);
-    let normalized = rms_norm_gemma_f32(&x, &[1.0, 1.0], 0.0).unwrap();
+fn rms_norm_uses_weights_as_plain_scales_or_none() {
+    let weighted = rms_norm(&[3.0, 4.0], Some(&[2.0, 0.5]), 0.0).unwrap();
+    assert!((weighted[0] - 1.697_056_3).abs() < 1e-6);
+    assert!((weighted[1] - 0.565_685_4).abs() < 1e-6);
 
-    assert!((normalized.as_slice()[0] - 1.697_056_3).abs() < 1e-6);
-    assert!((normalized.as_slice()[1] - 2.262_741_8).abs() < 1e-6);
+    let unweighted = rms_norm(&[3.0, 4.0], None, 0.0).unwrap();
+    assert!((unweighted[0] - 0.848_528_15).abs() < 1e-6);
+    assert!(rms_norm(&[3.0, 4.0], Some(&[1.0]), 0.0).is_err());
 }
 
 #[test]

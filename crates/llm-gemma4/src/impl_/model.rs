@@ -2,7 +2,7 @@ use llm_backend_cpu::{
     buffer::F32Buf,
     dequant::dequant_q8_0,
     matvec::{matvec_bf16, matvec_f32, matvec_q8_0, quantize_q8_0, Q8_0_BLOCK_BYTES, Q8_0_BLOCK_VALUES},
-    ops::rms_norm_gemma_f32,
+    ops::rms_norm,
     port::CpuPort,
 };
 use llm_eng::{
@@ -20,8 +20,6 @@ use crate::{
     eng::{kv_source_layer, GlobalPolicy, LocalWindowPolicy},
     idea::{layer_attention_kind, AttentionKind, Gemma4HyperParams},
 };
-
-const EPS: f32 = 1e-6;
 
 const TOKEN_EMBD: &str = "token_embd.weight";
 const OUTPUT: &str = "output.weight";
@@ -71,18 +69,21 @@ where
         let mut weights = WeightStore::default();
         let d = hp.d_model;
         let d_ff = 2 * d;
-        let mut insert = |name: String, len: usize| {
+        // Matrices get small values around 0, norm scales values around 1.
+        let mut insert_around = |name: String, len: usize, center: f32| {
             weights.insert(name, TensorBlob::F32((0..len).map(|_| {
                 state = state.wrapping_mul(6_364_136_223_846_793_005).wrapping_add(1);
-                ((state >> 40) as f32 / (1u32 << 24) as f32 - 0.5) * 0.2
+                center + ((state >> 40) as f32 / (1u32 << 24) as f32 - 0.5) * 0.2
             }).collect()));
         };
+        let mut insert = |name: String, len: usize| insert_around(name.clone(), len, if name.contains("norm") { 1.0 } else { 0.0 });
         insert(TOKEN_EMBD.into(), hp.vocab_size * d);
         insert(OUTPUT_NORM.into(), d);
         for layer in 0..hp.n_layers {
             let head_dim = hp.head_dim(layer);
             let (q_dim, kv_dim) = (hp.n_heads * head_dim, hp.n_kv_heads * head_dim);
-            for name in ["attn_norm", "ffn_norm"] { insert(blk(layer, name), d); }
+            for name in ["attn_norm", "post_attention_norm", "ffn_norm", "post_ffw_norm"] { insert(blk(layer, name), d); }
+            for name in ["attn_q_norm", "attn_k_norm"] { insert(blk(layer, name), head_dim); }
             insert(blk(layer, "attn_q"), q_dim * d);
             insert(blk(layer, "attn_k"), kv_dim * d);
             insert(blk(layer, "attn_v"), kv_dim * d);
@@ -170,6 +171,22 @@ where
     }
     fn layer_position(&self, op: LayerOp) -> usize { match op { LayerOp::Prefill => self.prefill_position, LayerOp::Decode { position } => position } }
 
+    /// RMSNorm with a stored weight.
+    fn norm(&self, x: &[f32], name: &str) -> Result<F32Buf, EngError> {
+        Ok(rms_norm(x, Some(self.tensor(name)?), self.hp.rms_norm_eps)?.into())
+    }
+
+    /// Normalizes each `head_dim`-wide head of `x` on its own (Gemma 4's
+    /// q/k/v norms), scaled by the weight `name` if given.
+    fn norm_heads(&self, x: &mut [f32], head_dim: usize, name: Option<&str>) -> Result<(), EngError> {
+        let weight = name.map(|name| self.tensor(name)).transpose()?;
+        for head in x.chunks_exact_mut(head_dim) {
+            let normalized = rms_norm(head, weight, self.hp.rms_norm_eps)?;
+            head.copy_from_slice(&normalized);
+        }
+        Ok(())
+    }
+
     /// Applies RoPE to each `head_dim`-wide head in `x`.
     fn rope_heads(&self, x: &mut [f32], head_dim: usize, position: usize, theta: f32, rope_dims: usize) -> Result<(), EngError> {
         for head in x.chunks_exact_mut(head_dim) {
@@ -233,19 +250,21 @@ where
         let kind = layer_attention_kind(&self.hp, layer);
         let position = self.layer_position(op);
         let input = acts.get(x)?.clone();
-        // Gemma RMSNorm uses its learned weights as a delta: effective scale is `1 + weight`.
-        let normalized = rms_norm_gemma_f32(&input, self.tensor(&blk(layer, "attn_norm"))?, EPS)?;
+        let normalized = self.norm(input.as_slice(), &blk(layer, "attn_norm"))?;
         let (theta, rope_dims) = match kind {
             AttentionKind::Local { .. } => (self.hp.local_rope_base, head_dim),
             AttentionKind::Global => (self.hp.global_p_rope.base, ((head_dim as f32 * self.hp.global_p_rope.p) as usize / 2) * 2),
         };
         let mut q = self.project(normalized.as_slice(), &blk(layer, "attn_q"), n_heads * head_dim)?;
+        self.norm_heads(q.as_mut_slice(), head_dim, Some(&blk(layer, "attn_q_norm")))?;
         self.rope_heads(q.as_mut_slice(), head_dim, position, theta, rope_dims)?;
 
         let source = kv_source_layer(&self.hp, layer).map_err(|e| EngError::Compute(e.to_string()))?;
         if source == layer {
             let mut k = self.project(normalized.as_slice(), &blk(layer, "attn_k"), n_kv_heads * head_dim)?;
-            let v = self.project(normalized.as_slice(), &blk(layer, "attn_v"), n_kv_heads * head_dim)?;
+            let mut v = self.project(normalized.as_slice(), &blk(layer, "attn_v"), n_kv_heads * head_dim)?;
+            self.norm_heads(k.as_mut_slice(), head_dim, Some(&blk(layer, "attn_k_norm")))?;
+            self.norm_heads(v.as_mut_slice(), head_dim, None)?;
             self.rope_heads(k.as_mut_slice(), head_dim, position, theta, rope_dims)?;
             self.context.append(layer, k.as_slice().to_vec(), v.as_slice().to_vec())?;
         }
@@ -254,14 +273,16 @@ where
         let scale = (head_dim as f32).sqrt().recip();
         let attended = attend(&self.port, q.as_slice(), &keys[range.clone()], &values[range], n_heads, n_kv_heads, scale)?;
         let attention = self.project(&attended, &blk(layer, "attn_output"), d)?;
+        let attention = self.norm(attention.as_slice(), &blk(layer, "post_attention_norm"))?;
         let residual = self.port.add(&input, &attention)?;
 
-        let ffn_input = rms_norm_gemma_f32(&residual, self.tensor(&blk(layer, "ffn_norm"))?, EPS)?;
+        let ffn_input = self.norm(residual.as_slice(), &blk(layer, "ffn_norm"))?;
         let d_ff = self.rows(&blk(layer, "ffn_gate"), d)?;
         let gate = self.project(ffn_input.as_slice(), &blk(layer, "ffn_gate"), d_ff)?;
         let up = self.project(ffn_input.as_slice(), &blk(layer, "ffn_up"), d_ff)?;
         let gated: Vec<f32> = gate.as_slice().iter().zip(up.as_slice()).map(|(&g, &u)| g / (1.0 + (-g).exp()) * u).collect();
         let ffn = self.project(&gated, &blk(layer, "ffn_down"), d)?;
+        let ffn = self.norm(ffn.as_slice(), &blk(layer, "post_ffw_norm"))?;
         let mut output = self.port.add(&residual, &ffn)?;
         // ponytail: only accepts directly lookupable `[vocab, d_model]` PLE
         // tensors; add projection variants once a real GGUF exposes one.
@@ -275,7 +296,7 @@ where
         Ok(acts.push(output))
     }
     fn logits<'a>(&mut self, _: &(), x: ActId, acts: &'a mut CpuActivations) -> Result<&'a [f32], EngError> {
-        let normalized = rms_norm_gemma_f32(acts.get(x)?, self.tensor(OUTPUT_NORM)?, EPS)?;
+        let normalized = self.norm(acts.get(x)?.as_slice(), OUTPUT_NORM)?;
         let logits = self.project(normalized.as_slice(), self.output_name(), self.hp.vocab_size)?;
         self.last_logits = logits.as_slice().to_vec();
         let logits = acts.push(logits);

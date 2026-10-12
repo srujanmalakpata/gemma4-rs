@@ -38,35 +38,25 @@ pub fn matmul_f32(
     Ok(result.into())
 }
 
-pub fn rms_norm_f32(x: &F32Buf, weight: &F32Buf, eps: f32) -> Result<F32Buf, EngError> {
-    if x.len() != weight.len() || x.is_empty() || eps < 0.0 {
+/// RMSNorm as ggml computes it: the mean of squares is accumulated in f64,
+/// then `x / sqrt(mean + eps)`, times `weight` when there is one. Gemma 4
+/// GGUFs store norm weights as plain scales (the converter applies no
+/// `1 + w` shift), and Gemma 4 normalizes V with no weight at all.
+pub fn rms_norm(x: &[f32], weight: Option<&[f32]>, eps: f32) -> Result<Vec<f32>, EngError> {
+    if x.is_empty() || eps < 0.0 || weight.is_some_and(|weight| weight.len() != x.len()) {
         return Err(compute_error("invalid RMS norm inputs"));
     }
-
-    let mean_square = x.as_slice().iter().map(|value| value * value).sum::<f32>() / x.len() as f32;
-    let scale = (mean_square + eps).sqrt().recip();
-    Ok(x.as_slice()
-        .iter()
-        .zip(weight.as_slice())
-        .map(|(value, weight)| value * scale * weight)
-        .collect::<Vec<_>>()
-        .into())
+    let sum: f64 = x.iter().map(|value| f64::from(value * value)).sum();
+    let mean = (sum / x.len() as f64) as f32;
+    let scale = 1.0 / (mean + eps).sqrt();
+    Ok(match weight {
+        Some(weight) => x.iter().zip(weight).map(|(value, weight)| value * scale * weight).collect(),
+        None => x.iter().map(|value| value * scale).collect(),
+    })
 }
 
-/// Gemma stores RMSNorm weights as a delta, so the effective scale is `1 + weight`.
-pub fn rms_norm_gemma_f32(x: &F32Buf, weight: &[f32], eps: f32) -> Result<F32Buf, EngError> {
-    if x.len() != weight.len() || x.is_empty() || eps < 0.0 {
-        return Err(compute_error("invalid RMS norm inputs"));
-    }
-
-    let mean_square = x.as_slice().iter().map(|value| value * value).sum::<f32>() / x.len() as f32;
-    let scale = (mean_square + eps).sqrt().recip();
-    Ok(x.as_slice()
-        .iter()
-        .zip(weight)
-        .map(|(value, weight)| value * scale * (1.0 + weight))
-        .collect::<Vec<_>>()
-        .into())
+pub fn rms_norm_f32(x: &F32Buf, weight: &F32Buf, eps: f32) -> Result<F32Buf, EngError> {
+    rms_norm(x.as_slice(), Some(weight.as_slice()), eps).map(F32Buf::from)
 }
 
 pub fn softmax_f32(x: &F32Buf) -> Result<F32Buf, EngError> {
