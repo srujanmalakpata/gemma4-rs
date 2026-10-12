@@ -1,8 +1,8 @@
 name: CI
 
-# Runs on pull requests and on demand only, not on every push, to save
-# GitHub Actions minutes on this private repo.
 on:
+  push:
+    branches: [main]
   pull_request:
   workflow_dispatch:
 

@@ -1,4 +1,4 @@
-# llm-inference-engine
+# gemma4-rs
 
 A Rust CPU inference engine for Google's Gemma 4 E2B in GGUF format, written without ML
 libraries or an inference runtime (dependencies: `half`, `rand`, `clap`, `anyhow`, `thiserror`, `tracing`,
@@ -53,7 +53,8 @@ Not verified:
   model would be shared.
 - Other Gemma 4 sizes, other GGUF files or quantization types (only F32, F16, BF16 and Q8_0
   tensors load), contexts longer than 628 tokens, or sampling quality.
-- On Linux: CI runs the tests and clippy on pull requests, but has not run yet.
+- Anything on Linux beyond CI: the workflow in `.github/workflows/ci.yml` runs the tests and clippy
+  on every push to `main` and on pull requests; its results are on the repo's Actions page.
 
 ## Speed
 
