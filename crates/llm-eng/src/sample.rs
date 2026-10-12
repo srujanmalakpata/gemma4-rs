@@ -35,13 +35,19 @@ pub fn sample_logits(
         return best as u32;
     }
 
-    let mut candidates: Vec<_> = logits
-        .iter()
-        .enumerate()
-        .map(|(index, &logit)| (index, ((logit - logits[best]) / temperature).exp()))
-        .collect();
+    // Pick the top-k logits in linear time and sort only those; sorting all
+    // 262,144 Gemma logits every token was slow. exp() is monotonic, so the
+    // top-k logits give the top-k weights.
+    let mut candidates: Vec<(usize, f32)> = logits.iter().copied().enumerate().collect();
+    let k = top_k.min(candidates.len());
+    if k < candidates.len() {
+        candidates.select_nth_unstable_by(k - 1, |(_, a), (_, b)| b.total_cmp(a));
+        candidates.truncate(k);
+    }
     candidates.sort_unstable_by(|(_, a), (_, b)| b.total_cmp(a));
-    candidates.truncate(top_k.min(candidates.len()));
+    for (_, weight) in &mut candidates {
+        *weight = ((*weight - logits[best]) / temperature).exp();
+    }
 
     let total: f32 = candidates.iter().map(|(_, weight)| weight).sum();
     let threshold = top_p.clamp(0.0, 1.0) * total;
