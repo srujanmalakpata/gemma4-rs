@@ -1,7 +1,7 @@
 use llm_backend_cpu::{
     buffer::F32Buf,
     dequant::dequant_q8_0,
-    matvec::{matvec_bf16, matvec_f32, matvec_q8_0, matvec_q8_0_f32, quantize_q8_0, Q8_0_BLOCK_BYTES, Q8_0_BLOCK_VALUES},
+    matvec::{matvec_bf16, matvec_f32, matvec_q8_0, matvec_q8_0_f32, matvec_q8_0_f64_sums, quantize_q8_0, Q8_0_BLOCK_BYTES, Q8_0_BLOCK_VALUES},
     ops::{gelu_tanh, gelu_tanh_fp16_table, rms_norm, rope_neox},
     port::CpuPort,
 };
@@ -48,11 +48,14 @@ pub struct Numerics {
     /// Evaluate GELU through ggml's fp16 lookup table instead of in f32.
     /// Only for reproducing llama.cpp's arithmetic in comparisons.
     pub fp16_gelu: bool,
+    /// With `quantize_q8_activations` off, take Q8_0 mat-vec sums in f64.
+    /// Only for measuring how much float summation order moves the output.
+    pub f64_sums: bool,
 }
 
 impl Default for Numerics {
     fn default() -> Self {
-        Self { quantize_q8_activations: true, fp16_gelu: false }
+        Self { quantize_q8_activations: true, fp16_gelu: false, f64_sums: false }
     }
 }
 
@@ -204,6 +207,8 @@ where
                 if (*nrows, *ncols) != (out, x.len()) { return Err(shape_error()); }
                 if self.numerics.quantize_q8_activations {
                     matvec_q8_0(data, out, &quantize_q8_0(x)?)?
+                } else if self.numerics.f64_sums {
+                    matvec_q8_0_f64_sums(data, out, x)?
                 } else {
                     matvec_q8_0_f32(data, out, x)?
                 }

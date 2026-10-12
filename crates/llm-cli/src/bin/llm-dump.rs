@@ -36,6 +36,9 @@ struct Args {
     /// Evaluate GELU through ggml's fp16 lookup table, like llama.cpp.
     #[arg(long)]
     fp16_gelu: bool,
+    /// With --f32-activations, take Q8_0 mat-vec sums in f64.
+    #[arg(long)]
+    f64_sums: bool,
 }
 
 fn main() -> Result<()> {
@@ -62,7 +65,11 @@ fn main() -> Result<()> {
     let weights = load_gemma4_e2b(&args.model)?;
     let loaded = started.elapsed();
     let mut model = Gemma4CpuModel::<KvCache<Vec<f32>, Vec<f32>>>::from_weights(weights, hp)?
-        .with_numerics(Numerics { quantize_q8_activations: !args.f32_activations, fp16_gelu: args.fp16_gelu });
+        .with_numerics(Numerics {
+            quantize_q8_activations: !args.f32_activations,
+            fp16_gelu: args.fp16_gelu,
+            f64_sums: args.f64_sums,
+        });
     let started = Instant::now();
     let rows = sequence_logits(&mut model, &tokens)?;
     let ran = started.elapsed();

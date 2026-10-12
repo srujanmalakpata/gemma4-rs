@@ -1,7 +1,7 @@
 use half::f16;
 use llm_backend_cpu::dequant::dequant_q8_0;
 use llm_backend_cpu::matvec::{
-    bf16_to_f32, f32_to_bf16, matvec_bf16, matvec_f32, matvec_q8_0, matvec_q8_0_f32, quantize_q8_0,
+    bf16_to_f32, f32_to_bf16, matvec_bf16, matvec_f32, matvec_q8_0, matvec_q8_0_f32, matvec_q8_0_f64_sums, quantize_q8_0,
 };
 
 /// Deterministic values in [-1, 1).
@@ -71,8 +71,10 @@ fn q8_0_matvec_with_f32_activations_equals_the_dequantized_product() {
     let x = values(2, cols);
     let expected = naive(&dequant_q8_0(&bytes).unwrap(), &x);
     let actual = matvec_q8_0_f32(&bytes, rows, &x).unwrap();
-    for (e, a) in expected.iter().zip(&actual) {
+    let f64_sums = matvec_q8_0_f64_sums(&bytes, rows, &x).unwrap();
+    for ((e, a), b) in expected.iter().zip(&actual).zip(&f64_sums) {
         assert!((e - a).abs() < 1e-4, "{e} vs {a}");
+        assert!((e - b).abs() < 1e-4, "{e} vs {b}");
     }
 }
 

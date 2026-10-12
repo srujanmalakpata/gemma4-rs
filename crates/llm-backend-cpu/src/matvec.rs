@@ -95,6 +95,31 @@ pub fn matvec_q8_0_f32(weights: &[u8], rows: usize, x: &[f32]) -> Result<Vec<f32
     }))
 }
 
+/// Like [`matvec_q8_0_f32`], but every sum is taken in f64. Slower, with
+/// almost no rounding in the sums; comparing the two shows how much float
+/// summation order alone moves a model's output.
+pub fn matvec_q8_0_f64_sums(weights: &[u8], rows: usize, x: &[f32]) -> Result<Vec<f32>, EngError> {
+    let cols = x.len();
+    if !cols.is_multiple_of(Q8_0_BLOCK_VALUES) {
+        return Err(EngError::Compute(format!("Q8_0 row length {cols} is not a multiple of {Q8_0_BLOCK_VALUES}")));
+    }
+    let row_bytes = cols / Q8_0_BLOCK_VALUES * Q8_0_BLOCK_BYTES;
+    check_shape(weights.len(), rows, row_bytes, "Q8_0")?;
+    Ok(parallel_rows(rows, cols, |row| {
+        let row = &weights[row * row_bytes..(row + 1) * row_bytes];
+        let sum: f64 = row
+            .chunks_exact(Q8_0_BLOCK_BYTES)
+            .zip(x.chunks_exact(Q8_0_BLOCK_VALUES))
+            .map(|(block, x)| {
+                let scale = f64::from(f16::from_le_bytes([block[0], block[1]]).to_f32());
+                let dot: f64 = block[2..].iter().zip(x).map(|(&w, &x)| f64::from(w as i8) * f64::from(x)).sum();
+                dot * scale
+            })
+            .sum();
+        sum as f32
+    }))
+}
+
 /// `W @ x` for BF16 weights; `x` is rounded to bf16 first, as ggml does.
 pub fn matvec_bf16(weights: &[u16], rows: usize, x: &[f32]) -> Result<Vec<f32>, EngError> {
     let cols = x.len();
