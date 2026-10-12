@@ -59,6 +59,22 @@ pub fn rms_norm_f32(x: &F32Buf, weight: &F32Buf, eps: f32) -> Result<F32Buf, Eng
     rms_norm(x.as_slice(), Some(weight.as_slice()), eps).map(F32Buf::from)
 }
 
+/// Dot product of two f32 slices of equal length. Summing into 16
+/// independent accumulators lets the compiler use SIMD; a plain `.sum()`
+/// must add in order and runs one multiply-add at a time.
+pub fn dot_f32(a: &[f32], b: &[f32]) -> f32 {
+    const LANES: usize = 16;
+    let mut lanes = [0.0_f32; LANES];
+    let (a_chunks, b_chunks) = (a.chunks_exact(LANES), b.chunks_exact(LANES));
+    let tail: f32 = a_chunks.remainder().iter().zip(b_chunks.remainder()).map(|(x, y)| x * y).sum();
+    for (x, y) in a_chunks.zip(b_chunks) {
+        for lane in 0..LANES {
+            lanes[lane] += x[lane] * y[lane];
+        }
+    }
+    lanes.iter().sum::<f32>() + tail
+}
+
 /// GELU with the tanh approximation (`gelu_pytorch_tanh`, Gemma's FFN
 /// activation), with ggml's constants.
 pub fn gelu_tanh(x: f32) -> f32 {

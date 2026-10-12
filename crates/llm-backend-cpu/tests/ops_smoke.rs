@@ -2,7 +2,7 @@ use half::f16;
 use llm_backend_cpu::buffer::F32Buf;
 use llm_backend_cpu::dequant::dequant_q8_0;
 use llm_backend_cpu::ops::{
-    add_f32, gelu_tanh, gelu_tanh_fp16_table, matmul_f32, rms_norm, rms_norm_f32, rope_f32, rope_neox, softmax_f32,
+    add_f32, dot_f32, gelu_tanh, gelu_tanh_fp16_table, matmul_f32, rms_norm, rms_norm_f32, rope_f32, rope_neox, softmax_f32,
 };
 use llm_backend_cpu::port::CpuPort;
 use llm_eng::compute::ComputePort;
@@ -52,6 +52,16 @@ fn rms_norm_uses_weights_as_plain_scales_or_none() {
     let unweighted = rms_norm(&[3.0, 4.0], None, 0.0).unwrap();
     assert!((unweighted[0] - 0.848_528_15).abs() < 1e-6);
     assert!(rms_norm(&[3.0, 4.0], Some(&[1.0]), 0.0).is_err());
+}
+
+#[test]
+fn dot_f32_matches_a_plain_sum_for_any_length() {
+    for len in [0, 1, 15, 16, 17, 40, 256] {
+        let a: Vec<f32> = (0..len).map(|i| (i as f32 * 0.37).sin()).collect();
+        let b: Vec<f32> = (0..len).map(|i| (i as f32 * 0.11).cos()).collect();
+        let expected: f64 = a.iter().zip(&b).map(|(x, y)| f64::from(*x) * f64::from(*y)).sum();
+        assert!((f64::from(dot_f32(&a, &b)) - expected).abs() < 1e-4, "len {len}");
+    }
 }
 
 #[test]

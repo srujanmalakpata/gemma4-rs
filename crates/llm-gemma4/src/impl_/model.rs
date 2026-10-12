@@ -4,7 +4,7 @@ use llm_backend_cpu::{
     buffer::F32Buf,
     dequant::dequant_q8_0,
     matvec::{matvec_bf16, matvec_f32, matvec_q8_0, matvec_q8_0_f32, matvec_q8_0_f64_sums, quantize_q8_0, Q8_0_BLOCK_BYTES, Q8_0_BLOCK_VALUES},
-    ops::{gelu_tanh, gelu_tanh_fp16_table, rms_norm, rope_neox},
+    ops::{dot_f32, gelu_tanh, gelu_tanh_fp16_table, rms_norm, rope_neox},
     port::CpuPort,
 };
 use llm_eng::{
@@ -301,7 +301,7 @@ fn attend(
         let kv = head * n_kv_heads / n_heads * head_dim..(head * n_kv_heads / n_heads + 1) * head_dim;
         let scores: F32Buf = keys
             .iter()
-            .map(|key| qh.iter().zip(&key[kv.clone()]).map(|(a, b)| a * b).sum::<f32>() * scale)
+            .map(|key| dot_f32(qh, &key[kv.clone()]) * scale)
             .collect::<Vec<_>>()
             .into();
         let probabilities = port.softmax(&scores)?;
