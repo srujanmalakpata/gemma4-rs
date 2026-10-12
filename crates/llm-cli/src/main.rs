@@ -1,4 +1,4 @@
-use std::path::PathBuf;
+use std::{path::PathBuf, time::Instant};
 
 use anyhow::{Context, Result};
 use clap::Parser;
@@ -54,12 +54,15 @@ fn run(args: Args) -> Result<()> {
         .with_context(|| format!("cannot read the architecture of `{}`", args.model.display()))?;
     drop(gguf);
 
+    let started = Instant::now();
     let weights = load_gemma4_e2b(&args.model)
         .with_context(|| format!("cannot load model `{}`", args.model.display()))?;
     let mut model = Gemma4CpuModel::<llm_eng::context_memory::KvCache<Vec<f32>, Vec<f32>>>::from_weights(weights, hp)?
         .with_eos_token_ids(tokenizer.end_of_generation_ids().into_iter().map(|id| id.0));
+    let loaded = started.elapsed();
     let formatted = format_user_prompt(&args.prompt);
     let prompt_tokens = tokenizer.encode(&formatted, true);
+    let started = Instant::now();
     let generated = generate_cpu(
         &mut model,
         GenerateRequest {
@@ -70,6 +73,20 @@ fn run(args: Args) -> Result<()> {
         },
     )?;
 
+    let ran = started.elapsed();
+
     println!("{}", tokenizer.decode(&generated));
+    // Every position, prompt or generated, costs one forward pass; the last
+    // generated token needs none.
+    let passes = prompt_tokens.len() + generated.len().saturating_sub(1);
+    tracing::info!(
+        "loaded in {:.1} s; {} prompt + {} generated tokens in {:.2} s ({:.1} ms per token, {:.1} tokens/s)",
+        loaded.as_secs_f64(),
+        prompt_tokens.len(),
+        generated.len(),
+        ran.as_secs_f64(),
+        ran.as_secs_f64() * 1000.0 / passes.max(1) as f64,
+        passes as f64 / ran.as_secs_f64(),
+    );
     Ok(())
 }
