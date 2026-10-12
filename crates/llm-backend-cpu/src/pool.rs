@@ -8,11 +8,23 @@
 //! workers then claim chunks of rows through an atomic counter until none are
 //! left, so faster cores take more chunks and nobody queues behind a lock.
 //! Tasks own their inputs through `Arc`, so the pool needs no `unsafe`.
+//!
+//! While a model is decoding, a new mat-vec arrives every few tens of
+//! microseconds, so workers and the caller spin for a short while before
+//! sleeping: putting a thread to sleep and waking it again costs more.
 
-use std::sync::{
-    atomic::{AtomicUsize, Ordering},
-    mpsc, Arc, Condvar, Mutex, OnceLock,
+use std::{
+    sync::{
+        atomic::{AtomicUsize, Ordering},
+        mpsc::{self, TryRecvError},
+        Arc, Condvar, Mutex, OnceLock,
+    },
+    time::{Duration, Instant},
 };
+
+/// How long an idle worker, or a caller waiting for the last chunks,
+/// spins before sleeping.
+const SPIN_FOR: Duration = Duration::from_micros(200);
 
 struct Pool {
     workers: Vec<mpsc::Sender<Arc<Task>>>,
@@ -50,6 +62,13 @@ impl Task {
     }
 
     fn wait(&self) {
+        let deadline = Instant::now() + SPIN_FOR;
+        while Instant::now() < deadline {
+            if self.remaining.load(Ordering::Acquire) == 0 {
+                return;
+            }
+            std::hint::spin_loop();
+        }
         let mut finished = self.finished.lock().unwrap_or_else(|poison| poison.into_inner());
         while !*finished {
             finished = self.finished_signal.wait(finished).unwrap_or_else(|poison| poison.into_inner());
@@ -76,13 +95,31 @@ fn pool() -> &'static Pool {
                 let (sender, tasks) = mpsc::channel::<Arc<Task>>();
                 std::thread::Builder::new()
                     .name(format!("matvec-{index}"))
-                    .spawn(move || tasks.iter().for_each(|task| task.work()))
+                    .spawn(move || {
+                        while let Some(task) = next_task(&tasks) {
+                            task.work();
+                        }
+                    })
                     .expect("start a mat-vec worker thread");
                 sender
             })
             .collect();
         Pool { workers }
     })
+}
+
+/// Waits for the next task, spinning for [`SPIN_FOR`] before sleeping.
+/// Returns `None` once the pool is gone.
+fn next_task(tasks: &mpsc::Receiver<Arc<Task>>) -> Option<Arc<Task>> {
+    let deadline = Instant::now() + SPIN_FOR;
+    loop {
+        match tasks.try_recv() {
+            Ok(task) => return Some(task),
+            Err(TryRecvError::Disconnected) => return None,
+            Err(TryRecvError::Empty) if Instant::now() < deadline => std::hint::spin_loop(),
+            Err(TryRecvError::Empty) => return tasks.recv().ok(),
+        }
+    }
 }
 
 /// Evaluates `value(&data, i)` for `i` in `0..count`. Runs on the calling
