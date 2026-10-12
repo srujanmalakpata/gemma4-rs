@@ -34,6 +34,17 @@ fn e2b_uses_4_local_then_1_global_and_final_global() {
 }
 
 #[test]
+fn e2b_heads_are_256_wide_on_local_layers_and_512_on_global_layers() {
+    let hp = Gemma4HyperParams::e2b();
+    assert_eq!((hp.n_heads, hp.n_kv_heads), (8, 1));
+    assert_eq!(hp.head_dim(0), 256);
+    assert_eq!(hp.head_dim(4), 512);
+    assert_eq!(hp.head_dim(34), 512);
+    // Query width differs from the 1,536-wide residual stream.
+    assert_eq!(hp.n_heads * hp.head_dim(0), 2_048);
+}
+
+#[test]
 fn policies_select_the_expected_context_ranges() {
     assert_eq!(windowed_len(1000, 512), 488..1000);
     assert_eq!(LocalWindowPolicy::new(512).range(1000), 488..1000);

@@ -57,7 +57,7 @@ where
             &mut rng,
         ));
         generated.push(token);
-        if model.eos_token_id() == Some(token.0) {
+        if model.is_eos(token.0) {
             break;
         }
         if index + 1 == request.max_new_tokens {
@@ -102,7 +102,7 @@ where
         }
         let token = TokenId(sample_logits(&logits, request.sampling.temperature, request.sampling.top_p, request.sampling.top_k, &mut rng));
         generated.push(token);
-        if model.eos_token_id() == Some(token.0) {
+        if model.is_eos(token.0) {
             break;
         }
         if sequence.len() + 1 >= request.max_context {

@@ -8,7 +8,7 @@ use llm_gemma4::{
     impl_::{
         chat_template::format_user_prompt,
         generate::{generate_cpu, GenerateRequest},
-        model::{Gemma4CpuModel, HeadConfig},
+        model::Gemma4CpuModel,
         tokenizer::Tokenizer,
         weights::load_gemma4_e2b,
     },
@@ -50,15 +50,14 @@ fn run(args: Args) -> Result<()> {
         .with_context(|| format!("cannot open model `{}`", args.model.display()))?;
     let tokenizer = Tokenizer::from_gguf(&gguf)
         .with_context(|| format!("cannot read tokenizer from `{}`", args.model.display()))?;
-    let hp = Gemma4HyperParams::from_gguf_metadata(&gguf);
-    let heads = HeadConfig::from_gguf_metadata(&gguf, hp.d_model)
-        .with_context(|| format!("cannot read attention configuration from `{}`", args.model.display()))?;
+    let hp = Gemma4HyperParams::from_gguf_metadata(&gguf)
+        .with_context(|| format!("cannot read the architecture of `{}`", args.model.display()))?;
     drop(gguf);
 
     let weights = load_gemma4_e2b(&args.model)
         .with_context(|| format!("cannot load model `{}`", args.model.display()))?;
-    let mut model = Gemma4CpuModel::<llm_eng::context_memory::KvCache<Vec<f32>, Vec<f32>>>::from_weights(weights, hp, heads)?
-        .with_eos_token_id(tokenizer.eos_token_id().map(|id| id.0));
+    let mut model = Gemma4CpuModel::<llm_eng::context_memory::KvCache<Vec<f32>, Vec<f32>>>::from_weights(weights, hp)?
+        .with_eos_token_ids(tokenizer.end_of_generation_ids().into_iter().map(|id| id.0));
     let formatted = format_user_prompt(&args.prompt);
     let prompt_tokens = tokenizer.encode(&formatted, true);
     let generated = generate_cpu(
