@@ -2,7 +2,7 @@ use llm_backend_cpu::{
     buffer::F32Buf,
     dequant::dequant_q8_0,
     matvec::{matvec_bf16, matvec_f32, matvec_q8_0, quantize_q8_0, Q8_0_BLOCK_BYTES, Q8_0_BLOCK_VALUES},
-    ops::{gelu_tanh, rms_norm},
+    ops::{gelu_tanh, rms_norm, rope_neox},
     port::CpuPort,
 };
 use llm_eng::{
@@ -18,12 +18,14 @@ use llm_idea::{
 
 use crate::{
     eng::{kv_source_layer, GlobalPolicy, LocalWindowPolicy},
-    idea::{layer_attention_kind, AttentionKind, Gemma4HyperParams},
+    idea::{layer_attention_kind, proportional_rope_freq_factors, AttentionKind, Gemma4HyperParams},
 };
 
 const TOKEN_EMBD: &str = "token_embd.weight";
 const OUTPUT: &str = "output.weight";
 const OUTPUT_NORM: &str = "output_norm.weight";
+/// Per-pair RoPE frequency divisors for global layers.
+const ROPE_FREQS: &str = "rope_freqs.weight";
 
 /// GGUF name of a per-layer weight, e.g. `blk.3.attn_q.weight`.
 fn blk(layer: usize, name: &str) -> String {
@@ -67,16 +69,17 @@ where
         hp.validate().expect("synthetic hyperparameters");
         let mut state = seed;
         let mut weights = WeightStore::default();
+        weights.insert(ROPE_FREQS, TensorBlob::F32(proportional_rope_freq_factors(hp.head_dim_global, hp.global_p_rope.p)));
         let d = hp.d_model;
         let d_ff = 2 * d;
         // Matrices get small values around 0, norm scales values around 1.
-        let mut insert_around = |name: String, len: usize, center: f32| {
+        let mut insert = |name: String, len: usize| {
+            let center = if name.contains("norm") { 1.0 } else { 0.0 };
             weights.insert(name, TensorBlob::F32((0..len).map(|_| {
                 state = state.wrapping_mul(6_364_136_223_846_793_005).wrapping_add(1);
                 center + ((state >> 40) as f32 / (1u32 << 24) as f32 - 0.5) * 0.2
             }).collect()));
         };
-        let mut insert = |name: String, len: usize| insert_around(name.clone(), len, if name.contains("norm") { 1.0 } else { 0.0 });
         insert(TOKEN_EMBD.into(), hp.vocab_size * d);
         insert(OUTPUT_NORM.into(), d);
         for layer in 0..hp.n_layers {
@@ -187,12 +190,16 @@ where
         Ok(())
     }
 
-    /// Applies RoPE to each `head_dim`-wide head in `x`.
-    fn rope_heads(&self, x: &mut [f32], head_dim: usize, position: usize, theta: f32, rope_dims: usize) -> Result<(), EngError> {
+    /// Applies NEOX RoPE over the full width of each `head_dim`-wide head
+    /// in `x`. Global layers use the `rope_freqs` divisors (proportional
+    /// RoPE); sliding-window layers rotate every pair.
+    fn rope_heads(&self, x: &mut [f32], head_dim: usize, position: usize, kind: AttentionKind) -> Result<(), EngError> {
+        let (base, factors) = match kind {
+            AttentionKind::Local { .. } => (self.hp.local_rope_base, None),
+            AttentionKind::Global => (self.hp.global_p_rope.base, Some(self.tensor(ROPE_FREQS)?)),
+        };
         for head in x.chunks_exact_mut(head_dim) {
-            let mut chunk: F32Buf = head.to_vec().into();
-            self.port.rope(&mut chunk, position, theta, rope_dims)?;
-            head.copy_from_slice(chunk.as_slice());
+            rope_neox(head, position, base, head_dim, factors)?;
         }
         Ok(())
     }
@@ -253,13 +260,9 @@ where
         let position = self.layer_position(op);
         let input = acts.get(x)?.clone();
         let normalized = self.norm(input.as_slice(), &blk(layer, "attn_norm"))?;
-        let (theta, rope_dims) = match kind {
-            AttentionKind::Local { .. } => (self.hp.local_rope_base, head_dim),
-            AttentionKind::Global => (self.hp.global_p_rope.base, ((head_dim as f32 * self.hp.global_p_rope.p) as usize / 2) * 2),
-        };
         let mut q = self.project(normalized.as_slice(), &blk(layer, "attn_q"), n_heads * head_dim)?;
         self.norm_heads(q.as_mut_slice(), head_dim, Some(&blk(layer, "attn_q_norm")))?;
-        self.rope_heads(q.as_mut_slice(), head_dim, position, theta, rope_dims)?;
+        self.rope_heads(q.as_mut_slice(), head_dim, position, kind)?;
 
         let source = kv_source_layer(&self.hp, layer).map_err(|e| EngError::Compute(e.to_string()))?;
         if source == layer {
@@ -267,7 +270,7 @@ where
             let mut v = self.project(normalized.as_slice(), &blk(layer, "attn_v"), n_kv_heads * head_dim)?;
             self.norm_heads(k.as_mut_slice(), head_dim, Some(&blk(layer, "attn_k_norm")))?;
             self.norm_heads(v.as_mut_slice(), head_dim, None)?;
-            self.rope_heads(k.as_mut_slice(), head_dim, position, theta, rope_dims)?;
+            self.rope_heads(k.as_mut_slice(), head_dim, position, kind)?;
             self.context.append(layer, k.as_slice().to_vec(), v.as_slice().to_vec())?;
         }
         let (keys, values) = self.context.view(source, position + 1)?;

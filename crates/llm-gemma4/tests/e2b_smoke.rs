@@ -1,6 +1,6 @@
 use llm_eng::{context_memory::KvCache, sample::SamplingConfig};
 use llm_gemma4::{
-    idea::Gemma4HyperParams,
+    idea::{proportional_rope_freq_factors, Gemma4HyperParams},
     impl_::{
         chat_template::format_user_prompt,
         generate::{generate_cpu, GenerateRequest},
@@ -22,6 +22,21 @@ fn e2b_metadata_matches_the_published_config() {
         Gemma4HyperParams::from_gguf_metadata(&gguf).unwrap(),
         Gemma4HyperParams::e2b()
     );
+}
+
+#[test]
+fn e2b_rope_freqs_encode_proportional_rope_on_a_quarter_of_the_pairs() {
+    let Ok(path) = std::env::var("LLM_E2B_GGUF") else {
+        eprintln!("skipping E2B rope_freqs check: LLM_E2B_GGUF is unset");
+        return;
+    };
+    let mut gguf = GgufFile::open_path(&path).unwrap();
+    let bytes = gguf.read_tensor_bytes("rope_freqs.weight").unwrap();
+    let factors: Vec<f32> = bytes
+        .chunks_exact(4)
+        .map(|b| f32::from_le_bytes([b[0], b[1], b[2], b[3]]))
+        .collect();
+    assert_eq!(factors, proportional_rope_freq_factors(512, 0.25));
 }
 
 #[test]

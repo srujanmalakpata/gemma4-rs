@@ -91,21 +91,43 @@ pub fn softmax_f32(x: &F32Buf) -> Result<F32Buf, EngError> {
         .into())
 }
 
-pub fn rope_f32(x: &mut F32Buf, pos: usize, theta: f32, dims: usize) -> Result<(), EngError> {
-    if dims == 0 || !dims.is_multiple_of(2) || dims > x.len() || theta <= 0.0 {
+/// Rotary position embedding in the NEOX layout used by Gemma: the first
+/// `n_rot` values form `n_rot / 2` pairs `(x[i], x[i + n_rot / 2])`, pair
+/// `i` turning by `position * base^(-2i / n_rot) / freq_factors[i]`.
+/// Values past `n_rot` are left alone. Follows ggml's CPU kernel, including
+/// building the angles by repeated multiplication.
+pub fn rope_neox(
+    x: &mut [f32],
+    position: usize,
+    base: f32,
+    n_rot: usize,
+    freq_factors: Option<&[f32]>,
+) -> Result<(), EngError> {
+    let half = n_rot / 2;
+    if n_rot == 0
+        || !n_rot.is_multiple_of(2)
+        || n_rot > x.len()
+        || base <= 0.0
+        || freq_factors.is_some_and(|factors| factors.len() < half)
+    {
         return Err(compute_error("invalid RoPE inputs"));
     }
-
-    for pair in 0..dims / 2 {
-        let angle = pos as f32 / theta.powf((2 * pair) as f32 / dims as f32);
-        let (sin, cos) = angle.sin_cos();
-        let left = 2 * pair;
-        let right = left + 1;
-        let (a, b) = (x.as_slice()[left], x.as_slice()[right]);
-        x.as_mut_slice()[left] = a * cos - b * sin;
-        x.as_mut_slice()[right] = a * sin + b * cos;
+    let theta_scale = base.powf(-2.0 / n_rot as f32);
+    let mut theta = position as f32;
+    for i in 0..half {
+        let factor = freq_factors.map_or(1.0, |factors| factors[i]);
+        let angle = theta / factor;
+        let (sin, cos) = (angle.sin(), angle.cos());
+        let (a, b) = (x[i], x[i + half]);
+        x[i] = a * cos - b * sin;
+        x[i + half] = a * sin + b * cos;
+        theta *= theta_scale;
     }
     Ok(())
+}
+
+pub fn rope_f32(x: &mut F32Buf, pos: usize, theta: f32, dims: usize) -> Result<(), EngError> {
+    rope_neox(x.as_mut_slice(), pos, theta, dims, None)
 }
 
 pub fn add_f32(a: &F32Buf, b: &F32Buf) -> Result<F32Buf, EngError> {

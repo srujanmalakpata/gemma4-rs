@@ -2,7 +2,7 @@ use half::f16;
 use llm_backend_cpu::buffer::F32Buf;
 use llm_backend_cpu::dequant::dequant_q8_0;
 use llm_backend_cpu::ops::{
-    add_f32, gelu_tanh, matmul_f32, rms_norm, rms_norm_f32, rope_f32, softmax_f32,
+    add_f32, gelu_tanh, matmul_f32, rms_norm, rms_norm_f32, rope_f32, rope_neox, softmax_f32,
 };
 use llm_backend_cpu::port::CpuPort;
 use llm_eng::compute::ComputePort;
@@ -77,6 +77,27 @@ fn elementwise_ops_and_rope_rotate_pairs() {
     rope_f32(&mut values, 1, 1.0, 2).unwrap();
     assert!((values.as_slice()[0] - 1.0_f32.cos()).abs() < 1e-6);
     assert!((values.as_slice()[1] - 1.0_f32.sin()).abs() < 1e-6);
+}
+
+#[test]
+fn rope_neox_pairs_halves_and_scales_frequencies() {
+    // n_rot = 4: pairs (x0, x2) at frequency 1 and (x1, x3) at base^-0.5.
+    let mut x = [1.0, 1.0, 0.0, 0.0, 7.0];
+    rope_neox(&mut x, 2, 100.0, 4, None).unwrap();
+    let (slow_sin, slow_cos) = (2.0_f32 / 10.0).sin_cos();
+    assert!((x[0] - 2.0_f32.cos()).abs() < 1e-6);
+    assert!((x[2] - 2.0_f32.sin()).abs() < 1e-6);
+    assert!((x[1] - slow_cos).abs() < 1e-6);
+    assert!((x[3] - slow_sin).abs() < 1e-6);
+    assert_eq!(x[4], 7.0, "values past n_rot are not rotated");
+}
+
+#[test]
+fn rope_neox_huge_freq_factors_leave_pairs_unrotated() {
+    let mut x = [1.0, 2.0, 3.0, 4.0];
+    rope_neox(&mut x, 5, 100.0, 4, Some(&[1.0, 1e30])).unwrap();
+    assert!((x[0] - (5.0_f32.cos() - 3.0 * 5.0_f32.sin())).abs() < 1e-5);
+    assert!((x[1] - 2.0).abs() < 1e-6 && (x[3] - 4.0).abs() < 1e-6);
 }
 
 #[test]

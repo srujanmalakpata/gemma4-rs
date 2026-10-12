@@ -100,6 +100,15 @@ impl Gemma4HyperParams {
             final_logit_softcap: f32_or("final_logit_softcapping", defaults.final_logit_softcap),
         };
         hp.validate()?;
+        // The engine rotates whole heads (proportional RoPE is expressed
+        // through `rope_freqs`), as llama.cpp's converter writes Gemma 4.
+        for (suffix, head_dim) in [("rope.dimension_count", hp.head_dim_global), ("rope.dimension_count_swa", hp.head_dim_local)] {
+            if let Some(n_rot) = gguf.metadata_usize(&key(suffix)) {
+                if n_rot != head_dim {
+                    return Err(HyperParamError(format!("{suffix} is {n_rot}, expected the head width {head_dim}")));
+                }
+            }
+        }
         if let Some(pattern) = gguf.metadata_bools(&key("attention.sliding_window_pattern")) {
             let expected: Vec<bool> = (0..hp.n_layers)
                 .map(|layer| matches!(layer_attention_kind(&hp, layer), AttentionKind::Local { .. }))
@@ -144,6 +153,15 @@ pub fn layer_attention_kind(hp: &Gemma4HyperParams, layer: usize) -> AttentionKi
             window: hp.sliding_window,
         }
     }
+}
+
+/// Gemma 4's "proportional" RoPE on global layers, as llama.cpp's converter
+/// encodes it in the `rope_freqs` tensor: all `head_dim` values are rotated
+/// NEOX-style, but only the first `head_dim * p / 2` frequency pairs turn;
+/// the rest get a factor of 1e30, which divides their angle to ~0.
+pub fn proportional_rope_freq_factors(head_dim: usize, p: f32) -> Vec<f32> {
+    let rotated = (head_dim as f32 * p / 2.0) as usize;
+    (0..head_dim / 2).map(|pair| if pair < rotated { 1.0 } else { 1e30 }).collect()
 }
 
 /// Extension point for adding the per-layer PLE residual during model execution.
