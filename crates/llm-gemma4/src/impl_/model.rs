@@ -1,8 +1,8 @@
 use llm_backend_cpu::{
     buffer::F32Buf,
     dequant::dequant_q8_0,
-    matvec::{matvec_bf16, matvec_f32, matvec_q8_0, quantize_q8_0, Q8_0_BLOCK_BYTES, Q8_0_BLOCK_VALUES},
-    ops::{gelu_tanh, rms_norm, rope_neox},
+    matvec::{matvec_bf16, matvec_f32, matvec_q8_0, matvec_q8_0_f32, quantize_q8_0, Q8_0_BLOCK_BYTES, Q8_0_BLOCK_VALUES},
+    ops::{gelu_tanh, gelu_tanh_fp16_table, rms_norm, rope_neox},
     port::CpuPort,
 };
 use llm_eng::{
@@ -38,6 +38,24 @@ fn blk(layer: usize, name: &str) -> String {
     format!("blk.{layer}.{name}.weight")
 }
 
+/// Arithmetic choices that trade speed for exactness.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Numerics {
+    /// Quantize activations to Q8_0 before Q8_0 mat-vecs and use int8 dot
+    /// products, as llama.cpp's CPU backend does (default; faster). When
+    /// false, activations stay f32 and weight blocks are dequantized.
+    pub quantize_q8_activations: bool,
+    /// Evaluate GELU through ggml's fp16 lookup table instead of in f32.
+    /// Only for reproducing llama.cpp's arithmetic in comparisons.
+    pub fp16_gelu: bool,
+}
+
+impl Default for Numerics {
+    fn default() -> Self {
+        Self { quantize_q8_activations: true, fp16_gelu: false }
+    }
+}
+
 #[derive(Default)]
 pub struct CpuActivations {
     values: Vec<F32Buf>,
@@ -64,6 +82,7 @@ pub struct Gemma4CpuModel<C = KvCache<Vec<f32>, Vec<f32>>> {
     eos_token_ids: Vec<u32>,
     /// The current token's per-layer inputs, `n_layers` rows of `ple_dim`.
     per_layer_inputs: Vec<f32>,
+    numerics: Numerics,
 }
 
 impl<C> Gemma4CpuModel<C>
@@ -123,7 +142,12 @@ where
     }
 
     fn new(weights: WeightStore, hp: Gemma4HyperParams) -> Self {
-        Self { hp, weights, context: C::default(), port: CpuPort, prefill_position: 0, last_logits: Vec::new(), eos_token_ids: Vec::new(), per_layer_inputs: Vec::new() }
+        Self { hp, weights, context: C::default(), port: CpuPort, prefill_position: 0, last_logits: Vec::new(), eos_token_ids: Vec::new(), per_layer_inputs: Vec::new(), numerics: Numerics::default() }
+    }
+
+    pub fn with_numerics(mut self, numerics: Numerics) -> Self {
+        self.numerics = numerics;
+        self
     }
 
     /// Tokens that stop generation (`<eos>`, and `<turn|>` for chat).
@@ -178,7 +202,11 @@ where
             TensorBlob::F32(w) => matvec_f32(w, out, x).map_err(|_| shape_error())?,
             TensorBlob::Q8 { data, nrows, ncols } => {
                 if (*nrows, *ncols) != (out, x.len()) { return Err(shape_error()); }
-                matvec_q8_0(data, out, &quantize_q8_0(x)?)?
+                if self.numerics.quantize_q8_activations {
+                    matvec_q8_0(data, out, &quantize_q8_0(x)?)?
+                } else {
+                    matvec_q8_0_f32(data, out, x)?
+                }
             }
             TensorBlob::Bf16 { data, nrows, ncols } => {
                 if (*nrows, *ncols) != (out, x.len()) { return Err(shape_error()); }
@@ -211,6 +239,10 @@ where
             inputs.extend(normalized.as_slice().iter().zip(table).map(|(p, t)| (p + t * table_scale) * input_scale));
         }
         Ok(inputs)
+    }
+
+    fn gelu(&self, x: f32) -> f32 {
+        if self.numerics.fp16_gelu { gelu_tanh_fp16_table(x) } else { gelu_tanh(x) }
     }
 
     /// RMSNorm with a stored weight.
@@ -324,7 +356,7 @@ where
         let d_ff = self.rows(&blk(layer, "ffn_gate"), d)?;
         let gate = self.project(ffn_input.as_slice(), &blk(layer, "ffn_gate"), d_ff)?;
         let up = self.project(ffn_input.as_slice(), &blk(layer, "ffn_up"), d_ff)?;
-        let gated: Vec<f32> = gate.as_slice().iter().zip(up.as_slice()).map(|(&g, &u)| gelu_tanh(g) * u).collect();
+        let gated: Vec<f32> = gate.as_slice().iter().zip(up.as_slice()).map(|(&g, &u)| self.gelu(g) * u).collect();
         let ffn = self.project(&gated, &blk(layer, "ffn_down"), d)?;
         let ffn = self.norm(ffn.as_slice(), &blk(layer, "post_ffw_norm"))?;
         let mut output = self.port.add(&residual, &ffn)?;
@@ -335,7 +367,7 @@ where
         if ple_dim > 0 {
             let gate = self.project(output.as_slice(), &blk(layer, "inp_gate"), ple_dim)?;
             let layer_input = &self.per_layer_inputs[layer * ple_dim..(layer + 1) * ple_dim];
-            let gated: Vec<f32> = gate.as_slice().iter().zip(layer_input).map(|(&g, &input)| gelu_tanh(g) * input).collect();
+            let gated: Vec<f32> = gate.as_slice().iter().zip(layer_input).map(|(&g, &input)| self.gelu(g) * input).collect();
             let projected = self.project(&gated, &blk(layer, "proj"), d)?;
             let projected = self.norm(projected.as_slice(), &blk(layer, "post_norm"))?;
             output = self.port.add(&output, &projected)?;

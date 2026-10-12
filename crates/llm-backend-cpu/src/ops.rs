@@ -67,6 +67,20 @@ pub fn gelu_tanh(x: f32) -> f32 {
     0.5 * x * (1.0 + (SQRT_2_OVER_PI * x * (1.0 + COEF_A * x * x)).tanh())
 }
 
+/// GELU as ggml's CPU kernels evaluate it: through a table indexed by the
+/// fp16 rounding of `x`, whose entries are themselves rounded to fp16, with
+/// `x <= -10` mapped to 0 and `x >= 10` to `x`. Only used to reproduce
+/// llama.cpp's arithmetic in comparisons; [`gelu_tanh`] is more precise.
+pub fn gelu_tanh_fp16_table(x: f32) -> f32 {
+    if x <= -10.0 {
+        0.0
+    } else if x >= 10.0 {
+        x
+    } else {
+        half::f16::from_f32(gelu_tanh(half::f16::from_f32(x).to_f32())).to_f32()
+    }
+}
+
 pub fn softmax_f32(x: &F32Buf) -> Result<F32Buf, EngError> {
     let Some(&max) = x
         .as_slice()

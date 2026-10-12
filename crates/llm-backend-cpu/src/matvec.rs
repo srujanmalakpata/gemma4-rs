@@ -72,6 +72,29 @@ pub fn matvec_q8_0(weights: &[u8], rows: usize, x: &Q8Activation) -> Result<Vec<
     }))
 }
 
+/// `W @ x` for Q8_0 weights with an unquantized f32 activation: each weight
+/// block is dequantized on the fly. Slower than [`matvec_q8_0`], but the
+/// only rounding is in the stored weights.
+pub fn matvec_q8_0_f32(weights: &[u8], rows: usize, x: &[f32]) -> Result<Vec<f32>, EngError> {
+    let cols = x.len();
+    if !cols.is_multiple_of(Q8_0_BLOCK_VALUES) {
+        return Err(EngError::Compute(format!("Q8_0 row length {cols} is not a multiple of {Q8_0_BLOCK_VALUES}")));
+    }
+    let row_bytes = cols / Q8_0_BLOCK_VALUES * Q8_0_BLOCK_BYTES;
+    check_shape(weights.len(), rows, row_bytes, "Q8_0")?;
+    Ok(parallel_rows(rows, cols, |row| {
+        let row = &weights[row * row_bytes..(row + 1) * row_bytes];
+        row.chunks_exact(Q8_0_BLOCK_BYTES)
+            .zip(x.chunks_exact(Q8_0_BLOCK_VALUES))
+            .map(|(block, x)| {
+                let scale = f16::from_le_bytes([block[0], block[1]]).to_f32();
+                let dot: f32 = block[2..].iter().zip(x).map(|(&w, &x)| f32::from(w as i8) * x).sum();
+                dot * scale
+            })
+            .sum()
+    }))
+}
+
 /// `W @ x` for BF16 weights; `x` is rounded to bf16 first, as ggml does.
 pub fn matvec_bf16(weights: &[u16], rows: usize, x: &[f32]) -> Result<Vec<f32>, EngError> {
     let cols = x.len();

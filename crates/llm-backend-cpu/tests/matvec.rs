@@ -1,7 +1,7 @@
 use half::f16;
 use llm_backend_cpu::dequant::dequant_q8_0;
 use llm_backend_cpu::matvec::{
-    bf16_to_f32, f32_to_bf16, matvec_bf16, matvec_f32, matvec_q8_0, quantize_q8_0,
+    bf16_to_f32, f32_to_bf16, matvec_bf16, matvec_f32, matvec_q8_0, matvec_q8_0_f32, quantize_q8_0,
 };
 
 /// Deterministic values in [-1, 1).
@@ -59,6 +59,18 @@ fn q8_0_matvec_equals_the_dot_product_of_the_dequantized_values() {
         .collect();
     let expected = naive(&dequant_q8_0(&bytes).unwrap(), &x_dequantized);
     let actual = matvec_q8_0(&bytes, rows, &x).unwrap();
+    for (e, a) in expected.iter().zip(&actual) {
+        assert!((e - a).abs() < 1e-4, "{e} vs {a}");
+    }
+}
+
+#[test]
+fn q8_0_matvec_with_f32_activations_equals_the_dequantized_product() {
+    let (rows, cols) = (64, 256);
+    let bytes = q8_0_bytes(&values(1, rows * cols));
+    let x = values(2, cols);
+    let expected = naive(&dequant_q8_0(&bytes).unwrap(), &x);
+    let actual = matvec_q8_0_f32(&bytes, rows, &x).unwrap();
     for (e, a) in expected.iter().zip(&actual) {
         assert!((e - a).abs() < 1e-4, "{e} vs {a}");
     }

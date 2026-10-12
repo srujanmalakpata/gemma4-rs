@@ -2,7 +2,7 @@ use half::f16;
 use llm_backend_cpu::buffer::F32Buf;
 use llm_backend_cpu::dequant::dequant_q8_0;
 use llm_backend_cpu::ops::{
-    add_f32, gelu_tanh, matmul_f32, rms_norm, rms_norm_f32, rope_f32, rope_neox, softmax_f32,
+    add_f32, gelu_tanh, gelu_tanh_fp16_table, matmul_f32, rms_norm, rms_norm_f32, rope_f32, rope_neox, softmax_f32,
 };
 use llm_backend_cpu::port::CpuPort;
 use llm_eng::compute::ComputePort;
@@ -61,6 +61,14 @@ fn gelu_tanh_matches_pytorch_tanh_approximation() {
     assert!((gelu_tanh(1.0) - 0.841_192).abs() < 1e-6);
     assert!((gelu_tanh(-1.0) + 0.158_808).abs() < 1e-6);
     assert!((gelu_tanh(3.0) - 2.996_363_7).abs() < 1e-6);
+}
+
+#[test]
+fn fp16_table_gelu_rounds_input_and_output_to_fp16() {
+    // 1.0001 rounds to fp16 1.0; gelu(1.0) = 0.841192 rounds to fp16 0.84130859.
+    assert_eq!(gelu_tanh_fp16_table(1.0001), 0.841_308_6);
+    assert_eq!(gelu_tanh_fp16_table(-10.0), 0.0);
+    assert_eq!(gelu_tanh_fp16_table(12.5), 12.5);
 }
 
 #[test]

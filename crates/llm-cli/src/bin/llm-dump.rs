@@ -13,7 +13,7 @@ use llm_gemma4::{
     generate::sequence_logits,
     idea::Gemma4HyperParams,
     impl_::{tokenizer::Tokenizer, weights::load_gemma4_e2b},
-    model::Gemma4CpuModel,
+    model::{Gemma4CpuModel, Numerics},
 };
 use llm_gguf::reader::GgufFile;
 use llm_idea::types::TokenId;
@@ -30,6 +30,12 @@ struct Args {
     /// Run these token ids (little-endian u32) instead of tokenizing the prompt.
     #[arg(long)]
     token_file: Option<PathBuf>,
+    /// Keep activations in f32 for Q8_0 mat-vecs instead of quantizing them.
+    #[arg(long)]
+    f32_activations: bool,
+    /// Evaluate GELU through ggml's fp16 lookup table, like llama.cpp.
+    #[arg(long)]
+    fp16_gelu: bool,
 }
 
 fn main() -> Result<()> {
@@ -55,7 +61,8 @@ fn main() -> Result<()> {
     let started = Instant::now();
     let weights = load_gemma4_e2b(&args.model)?;
     let loaded = started.elapsed();
-    let mut model = Gemma4CpuModel::<KvCache<Vec<f32>, Vec<f32>>>::from_weights(weights, hp)?;
+    let mut model = Gemma4CpuModel::<KvCache<Vec<f32>, Vec<f32>>>::from_weights(weights, hp)?
+        .with_numerics(Numerics { quantize_q8_activations: !args.f32_activations, fp16_gelu: args.fp16_gelu });
     let started = Instant::now();
     let rows = sequence_logits(&mut model, &tokens)?;
     let ran = started.elapsed();
