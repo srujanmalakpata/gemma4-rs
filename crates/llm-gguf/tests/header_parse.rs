@@ -28,6 +28,30 @@ fn parses_metadata_arrays_and_reads_q8_tensor_bytes() {
 }
 
 #[test]
+fn parses_scalar_metadata_of_every_width_and_bool_arrays() {
+    let mut bytes = Vec::new();
+    bytes.extend_from_slice(b"GGUF");
+    write_u32(&mut bytes, 3);
+    write_u64(&mut bytes, 0);
+    write_u64(&mut bytes, 5);
+    write_scalar(&mut bytes, "top_k", 5, &64_i32.to_le_bytes());
+    write_scalar(&mut bytes, "negative", 5, &(-1_i32).to_le_bytes());
+    write_scalar(&mut bytes, "byte", 0, &[7]);
+    write_scalar(&mut bytes, "wide", 12, &0.5_f64.to_le_bytes());
+    write_array_header(&mut bytes, "pattern", 7, 3);
+    bytes.extend_from_slice(&[1, 0, 1]);
+
+    let file = GgufFile::open_read(Cursor::new(bytes)).unwrap();
+
+    assert_eq!(file.metadata_usize("top_k"), Some(64));
+    assert_eq!(file.metadata_u32("top_k"), Some(64));
+    assert_eq!(file.metadata_usize("negative"), None);
+    assert_eq!(file.metadata_usize("byte"), Some(7));
+    assert_eq!(file.metadata_f32("wide"), Some(0.5));
+    assert_eq!(file.metadata_bools("pattern").unwrap(), [true, false, true]);
+}
+
+#[test]
 fn unsupported_tensor_type_names_the_tensor() {
     let mut bytes = llm_gguf::testutil::write_minimal_q8_tensor("bad.weight", &[1; 32]);
     let tensor_type_offset = 4 + 4 + 8 + 8 + 8 + "bad.weight".len() + 4 + 8;
@@ -69,6 +93,12 @@ fn write_gguf_with_metadata(values: &[i8; 32]) -> Vec<u8> {
     bytes.extend_from_slice(&0x3c00_u16.to_le_bytes());
     bytes.extend(values.iter().map(|&value| value as u8));
     bytes
+}
+
+fn write_scalar(bytes: &mut Vec<u8>, key: &str, ty: u32, value: &[u8]) {
+    write_string(bytes, key);
+    write_u32(bytes, ty);
+    bytes.extend_from_slice(value);
 }
 
 fn write_array_header(bytes: &mut Vec<u8>, key: &str, element_type: u32, count: u64) {

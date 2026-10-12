@@ -57,6 +57,10 @@ pub fn load_gemma4_e2b(path: impl AsRef<Path>) -> Result<WeightStore, WeightLoad
                     f16::from_le_bytes(bytes.try_into().expect("exact chunk size")).to_f32()
                 })
                 .collect(),
+            TensorType::BF16 => bytes
+                .chunks_exact(2)
+                .map(|bytes| f32::from_bits(u32::from(u16::from_le_bytes([bytes[0], bytes[1]])) << 16))
+                .collect(),
             TensorType::Q8_0 => {
                 dequant_q8_0(&bytes).map_err(|error| WeightLoadError::Dequantization {
                     name: name.clone(),

@@ -47,14 +47,19 @@ pub enum GgufError {
 #[derive(Debug, Clone)]
 enum MetadataValue {
     U32(u32),
+    /// Any signed or narrower integer type (i8, u8, i16, u16, i32).
+    I32(i32),
     U64(u64),
+    I64(i64),
     F32(f32),
+    F64(f64),
     Bool(bool),
     String(String),
     Strings(Vec<String>),
     F32s(Vec<f32>),
     I32s(Vec<i32>),
     U32s(Vec<u32>),
+    Bools(Vec<bool>),
     Array,
 }
 
@@ -167,6 +172,7 @@ impl<R: Read + Seek> GgufFile<R> {
     pub fn metadata_u32(&self, key: &str) -> Option<u32> {
         match self.metadata.get(key) {
             Some(MetadataValue::U32(value)) => Some(*value),
+            Some(MetadataValue::I32(value)) => u32::try_from(*value).ok(),
             _ => None,
         }
     }
@@ -174,7 +180,24 @@ impl<R: Read + Seek> GgufFile<R> {
     pub fn metadata_usize(&self, key: &str) -> Option<usize> {
         match self.metadata.get(key) {
             Some(MetadataValue::U32(value)) => Some(*value as usize),
+            Some(MetadataValue::I32(value)) => usize::try_from(*value).ok(),
             Some(MetadataValue::U64(value)) => usize::try_from(*value).ok(),
+            Some(MetadataValue::I64(value)) => usize::try_from(*value).ok(),
+            _ => None,
+        }
+    }
+
+    pub fn metadata_f32(&self, key: &str) -> Option<f32> {
+        match self.metadata.get(key) {
+            Some(MetadataValue::F32(value)) => Some(*value),
+            Some(MetadataValue::F64(value)) => Some(*value as f32),
+            _ => None,
+        }
+    }
+
+    pub fn metadata_bools(&self, key: &str) -> Option<&[bool]> {
+        match self.metadata.get(key) {
+            Some(MetadataValue::Bools(values)) => Some(values),
             _ => None,
         }
     }
@@ -253,7 +276,12 @@ fn read_metadata_value<R: Read>(
     ty: u32,
 ) -> Result<MetadataValue, GgufError> {
     match ty {
+        0 => Ok(MetadataValue::I32(read_u8(reader)?.into())),
+        1 => Ok(MetadataValue::I32((read_u8(reader)? as i8).into())),
+        2 => Ok(MetadataValue::I32(read_u16(reader)?.into())),
+        3 => Ok(MetadataValue::I32((read_u16(reader)? as i16).into())),
         4 => Ok(MetadataValue::U32(read_u32(reader)?)),
+        5 => Ok(MetadataValue::I32(read_i32(reader)?)),
         6 => Ok(MetadataValue::F32(read_f32(reader)?)),
         7 => Ok(MetadataValue::Bool(read_bool(reader)?)),
         8 => Ok(MetadataValue::String(read_string(
@@ -266,6 +294,8 @@ fn read_metadata_value<R: Read>(
             read_metadata_array(reader, key, element_ty, count)
         }
         10 => Ok(MetadataValue::U64(read_u64(reader)?)),
+        11 => Ok(MetadataValue::I64(read_u64(reader)? as i64)),
+        12 => Ok(MetadataValue::F64(f64::from_bits(read_u64(reader)?))),
         _ => Err(GgufError::UnsupportedMetadataType {
             key: key.to_owned(),
             ty,
@@ -292,6 +322,10 @@ fn read_metadata_array<R: Read>(
             .map(|_| read_f32(reader))
             .collect::<Result<Vec<_>, _>>()
             .map(MetadataValue::F32s),
+        7 => (0..count)
+            .map(|_| read_bool(reader))
+            .collect::<Result<Vec<_>, _>>()
+            .map(MetadataValue::Bools),
         8 => (0..count)
             .map(|_| read_string(reader, "metadata array string"))
             .collect::<Result<Vec<_>, _>>()
@@ -372,6 +406,12 @@ fn read_u8<R: Read>(reader: &mut R) -> Result<u8, GgufError> {
     let mut bytes = [0; 1];
     reader.read_exact(&mut bytes)?;
     Ok(bytes[0])
+}
+
+fn read_u16<R: Read>(reader: &mut R) -> Result<u16, GgufError> {
+    let mut bytes = [0; 2];
+    reader.read_exact(&mut bytes)?;
+    Ok(u16::from_le_bytes(bytes))
 }
 
 fn read_u32<R: Read>(reader: &mut R) -> Result<u32, GgufError> {

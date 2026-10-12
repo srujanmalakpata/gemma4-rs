@@ -2,6 +2,7 @@
 pub enum TensorType {
     F32,
     F16,
+    BF16,
     Q8_0,
 }
 
@@ -11,6 +12,7 @@ impl TensorType {
             0 => Some(Self::F32),
             1 => Some(Self::F16),
             8 => Some(Self::Q8_0),
+            30 => Some(Self::BF16),
             _ => None,
         }
     }
@@ -18,7 +20,7 @@ impl TensorType {
     pub(crate) fn byte_len(self, numel: usize) -> Option<usize> {
         match self {
             Self::F32 => numel.checked_mul(4),
-            Self::F16 => numel.checked_mul(2),
+            Self::F16 | Self::BF16 => numel.checked_mul(2),
             Self::Q8_0 if numel.is_multiple_of(32) => numel.checked_div(32)?.checked_mul(34),
             Self::Q8_0 => None,
         }
