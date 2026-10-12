@@ -239,7 +239,9 @@ where
         let token = tokens.last().ok_or_else(|| EngError::Msg("cannot embed an empty token sequence".into()))?.0 as usize;
         if token >= self.hp.vocab_size { return Err(EngError::Compute(format!("token {token} exceeds vocabulary"))); }
         self.current_token = Some(token);
-        let embedding = self.row(TOKEN_EMBD, token, self.hp.d_model)?;
+        // Gemma scales embeddings by sqrt(d_model) before the first layer.
+        let scale = (self.hp.d_model as f32).sqrt();
+        let embedding: Vec<f32> = self.row(TOKEN_EMBD, token, self.hp.d_model)?.iter().map(|value| value * scale).collect();
         Ok(acts.push(embedding.into()))
     }
     fn layer_count(&self, _: &()) -> usize { self.hp.n_layers }
@@ -270,8 +272,8 @@ where
         }
         let (keys, values) = self.context.view(source, position + 1)?;
         let range = match kind { AttentionKind::Local { window } => LocalWindowPolicy::new(window).range(keys.len()), AttentionKind::Global => GlobalPolicy.range(keys.len()) };
-        let scale = (head_dim as f32).sqrt().recip();
-        let attended = attend(&self.port, q.as_slice(), &keys[range.clone()], &values[range], n_heads, n_kv_heads, scale)?;
+        // q and k are RMS-normalized, so Gemma 4 uses no 1/sqrt(head_dim) scaling.
+        let attended = attend(&self.port, q.as_slice(), &keys[range.clone()], &values[range], n_heads, n_kv_heads, 1.0)?;
         let attention = self.project(&attended, &blk(layer, "attn_output"), d)?;
         let attention = self.norm(attention.as_slice(), &blk(layer, "post_attention_norm"))?;
         let residual = self.port.add(&input, &attention)?;
@@ -298,6 +300,9 @@ where
     fn logits<'a>(&mut self, _: &(), x: ActId, acts: &'a mut CpuActivations) -> Result<&'a [f32], EngError> {
         let normalized = self.norm(acts.get(x)?.as_slice(), OUTPUT_NORM)?;
         let logits = self.project(normalized.as_slice(), self.output_name(), self.hp.vocab_size)?;
+        // Final logit soft-capping: cap * tanh(logit / cap).
+        let cap = self.hp.final_logit_softcap;
+        let logits: F32Buf = logits.as_slice().iter().map(|logit| (logit * cap.recip()).tanh() * cap).collect::<Vec<_>>().into();
         self.last_logits = logits.as_slice().to_vec();
         let logits = acts.push(logits);
         Ok(acts.get(logits)?.as_slice())

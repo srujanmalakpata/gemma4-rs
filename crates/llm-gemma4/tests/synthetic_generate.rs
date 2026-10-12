@@ -55,6 +55,7 @@ fn generate_matches_between_cache_strategies() {
     assert_eq!(cached_tokens.len(), 3);
     assert_eq!(cached_tokens, recomputed_tokens);
     assert_relative_eq(cached.last_logits(), recomputed.last_logits(), 1e-4);
+    assert!(cached.last_logits().iter().all(|logit| logit.abs() <= 30.0));
 }
 
 fn assert_relative_eq(left: &[f32], right: &[f32], tolerance: f32) {
