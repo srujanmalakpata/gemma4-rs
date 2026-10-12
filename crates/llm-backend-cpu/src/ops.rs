@@ -54,7 +54,7 @@ pub fn rms_norm_f32(x: &F32Buf, weight: &F32Buf, eps: f32) -> Result<F32Buf, Eng
 }
 
 /// Gemma stores RMSNorm weights as a delta, so the effective scale is `1 + weight`.
-pub fn rms_norm_gemma_f32(x: &F32Buf, weight: &F32Buf, eps: f32) -> Result<F32Buf, EngError> {
+pub fn rms_norm_gemma_f32(x: &F32Buf, weight: &[f32], eps: f32) -> Result<F32Buf, EngError> {
     if x.len() != weight.len() || x.is_empty() || eps < 0.0 {
         return Err(compute_error("invalid RMS norm inputs"));
     }
@@ -63,7 +63,7 @@ pub fn rms_norm_gemma_f32(x: &F32Buf, weight: &F32Buf, eps: f32) -> Result<F32Bu
     let scale = (mean_square + eps).sqrt().recip();
     Ok(x.as_slice()
         .iter()
-        .zip(weight.as_slice())
+        .zip(weight)
         .map(|(value, weight)| value * scale * (1.0 + weight))
         .collect::<Vec<_>>()
         .into())

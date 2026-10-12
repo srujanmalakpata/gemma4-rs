@@ -46,9 +46,7 @@ fn rms_norm_scales_unit_vector() {
 #[test]
 fn gemma_rms_norm_adds_one_to_weights() {
     let x = F32Buf::from(vec![3.0, 4.0]);
-    let weight = F32Buf::from(vec![1.0, 1.0]);
-
-    let normalized = rms_norm_gemma_f32(&x, &weight, 0.0).unwrap();
+    let normalized = rms_norm_gemma_f32(&x, &[1.0, 1.0], 0.0).unwrap();
 
     assert!((normalized.as_slice()[0] - 1.697_056_3).abs() < 1e-6);
     assert!((normalized.as_slice()[1] - 2.262_741_8).abs() < 1e-6);

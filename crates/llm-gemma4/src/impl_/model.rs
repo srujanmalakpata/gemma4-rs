@@ -173,18 +173,19 @@ where
             }
         }
     }
-    fn tensor(&self, name: &str) -> Result<F32Buf, EngError> {
+    /// Borrows a weight; weights can be gigabytes, so they are never copied.
+    fn tensor(&self, name: &str) -> Result<&[f32], EngError> {
         for candidate in Self::names(name) {
-            if let Ok(TensorBlob::F32(values)) = self.weights.get(&candidate) { return Ok(values.clone().into()); }
+            if let Ok(TensorBlob::F32(values)) = self.weights.get(&candidate) { return Ok(values); }
         }
         Err(EngError::MissingWeight(name.into()))
     }
-    fn optional_tensor(&self, name: &str) -> Option<F32Buf> { self.tensor(name).ok() }
+    fn optional_tensor(&self, name: &str) -> Option<&[f32]> { self.tensor(name).ok() }
     /// GGUF linear tensors are row-major `[out, in]`; this computes `x @ Wᵀ`.
     fn project(&self, x: &[f32], name: &str, out: usize) -> Result<F32Buf, EngError> {
         let w = self.tensor(name)?;
         if w.len() != x.len() * out { return Err(EngError::Compute(format!("weight `{name}` has {}, expected {}x{}", w.len(), out, x.len()))); }
-        Ok(w.as_slice().chunks_exact(x.len()).map(|row| row.iter().zip(x).map(|(a, b)| a * b).sum()).collect::<Vec<f32>>().into())
+        Ok(w.chunks_exact(x.len()).map(|row| row.iter().zip(x).map(|(a, b)| a * b).sum()).collect::<Vec<f32>>().into())
     }
     fn layer_position(&self, op: LayerOp) -> usize { match op { LayerOp::Prefill => self.prefill_position, LayerOp::Decode { position } => position } }
 }
@@ -203,7 +204,7 @@ where
         self.current_token = Some(token);
         let table = self.tensor("tok_embeddings")?;
         let d = self.hp.d_model;
-        Ok(acts.push(table.as_slice()[token * d..(token + 1) * d].to_vec().into()))
+        Ok(acts.push(table[token * d..(token + 1) * d].to_vec().into()))
     }
     fn layer_count(&self, _: &()) -> usize { self.hp.n_layers }
     fn layer(&mut self, _: &(), layer: usize, x: ActId, acts: &mut CpuActivations, op: LayerOp) -> Result<ActId, EngError> {
@@ -213,7 +214,7 @@ where
         let position = self.layer_position(op);
         let input = acts.get(x)?.clone();
         // Gemma RMSNorm uses its learned weights as a delta: effective scale is `1 + weight`.
-        let normalized = rms_norm_gemma_f32(&input, &self.tensor(&format!("layers.{layer}.attn_norm"))?, EPS)?;
+        let normalized = rms_norm_gemma_f32(&input, self.tensor(&format!("layers.{layer}.attn_norm"))?, EPS)?;
         let mut q = self.project(normalized.as_slice(), &format!("layers.{layer}.q"), d)?;
         let mut k = self.project(normalized.as_slice(), &format!("layers.{layer}.k"), kv_dim)?;
         let v = self.project(normalized.as_slice(), &format!("layers.{layer}.v"), kv_dim)?;
@@ -250,9 +251,8 @@ where
         }
         let attention = self.project(&attended, &format!("layers.{layer}.o"), d)?;
         let residual = self.port.add(&input, &attention)?;
-        let ffn_input = rms_norm_gemma_f32(&residual, &self.tensor(&format!("layers.{layer}.ffn_norm"))?, EPS)?;
-        let gate = self.tensor(&format!("layers.{layer}.gate"))?;
-        let d_ff = gate.len() / d;
+        let ffn_input = rms_norm_gemma_f32(&residual, self.tensor(&format!("layers.{layer}.ffn_norm"))?, EPS)?;
+        let d_ff = self.tensor(&format!("layers.{layer}.gate"))?.len() / d;
         let gate = self.project(ffn_input.as_slice(), &format!("layers.{layer}.gate"), d_ff)?;
         let up = self.project(ffn_input.as_slice(), &format!("layers.{layer}.up"), d_ff)?;
         let gated: Vec<f32> = gate.as_slice().iter().zip(up.as_slice()).map(|(&g, &u)| g / (1.0 + (-g).exp()) * u).collect();
@@ -263,14 +263,14 @@ where
         if self.hp.ple_dim > 0 {
             if let (Some(ple), Some(token)) = (self.optional_tensor(&format!("layers.{layer}.ple")), self.current_token) {
                 if ple.len() == self.hp.vocab_size * d {
-                    for (out, value) in output.as_mut_slice().iter_mut().zip(&ple.as_slice()[token * d..(token + 1) * d]) { *out += value; }
+                    for (out, value) in output.as_mut_slice().iter_mut().zip(&ple[token * d..(token + 1) * d]) { *out += value; }
                 }
             }
         }
         Ok(acts.push(output))
     }
     fn logits<'a>(&mut self, _: &(), x: ActId, acts: &'a mut CpuActivations) -> Result<&'a [f32], EngError> {
-        let normalized = rms_norm_gemma_f32(acts.get(x)?, &self.tensor("final_norm")?, EPS)?;
+        let normalized = rms_norm_gemma_f32(acts.get(x)?, self.tensor("final_norm")?, EPS)?;
         let logits = self.project(normalized.as_slice(), "lm_head", self.hp.vocab_size)?;
         self.last_logits = logits.as_slice().to_vec();
         let logits = acts.push(logits);
