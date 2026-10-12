@@ -14,6 +14,7 @@
 //! sleeping: putting a thread to sleep and waking it again costs more.
 
 use std::{
+    ops::Range,
     sync::{
         atomic::{AtomicUsize, Ordering},
         mpsc::{self, TryRecvError},
@@ -133,9 +134,38 @@ pub fn map_indices<D: Send + Sync + 'static>(
     parallel_min_work: usize,
     value: fn(&D, usize) -> f32,
 ) -> Vec<f32> {
+    run_chunks(count, work_per_item, parallel_min_work, move |range| {
+        range.map(|index| value(&data, index)).collect()
+    })
+}
+
+/// Like [`map_indices`] for items that produce several values each (for
+/// example one attention head): concatenates `value(&data, i)` for `i` in
+/// `0..count`.
+pub fn map_items<D: Send + Sync + 'static>(
+    data: Arc<D>,
+    count: usize,
+    work_per_item: usize,
+    parallel_min_work: usize,
+    value: fn(&D, usize) -> Vec<f32>,
+) -> Vec<f32> {
+    run_chunks(count, work_per_item, parallel_min_work, move |range| {
+        range.flat_map(|index| value(&data, index)).collect()
+    })
+}
+
+/// Splits `0..count` into chunks and concatenates `run(chunk)` in order,
+/// spreading chunks over the calling thread and the workers when the work
+/// is large enough.
+fn run_chunks(
+    count: usize,
+    work_per_item: usize,
+    parallel_min_work: usize,
+    run: impl Fn(Range<usize>) -> Vec<f32> + Send + Sync + 'static,
+) -> Vec<f32> {
     let pool = pool();
     if pool.workers.is_empty() || count.saturating_mul(work_per_item) < parallel_min_work {
-        return (0..count).map(|index| value(&data, index)).collect();
+        return run(0..count);
     }
     let chunk_len = count.div_ceil(threads() * CHUNKS_PER_THREAD).max(1);
     let chunks = count.div_ceil(chunk_len);
@@ -148,10 +178,8 @@ pub fn map_indices<D: Send + Sync + 'static>(
             let slots = Arc::clone(&slots);
             Box::new(move |chunk| {
                 let start = chunk * chunk_len;
-                let end = (start + chunk_len).min(count);
-                let values = (start..end).map(|index| value(&data, index)).collect();
                 // Each chunk is claimed exactly once, so its slot is empty.
-                let _ = slots[chunk].set(values);
+                let _ = slots[chunk].set(run(start..(start + chunk_len).min(count)));
             })
         },
         finished: Mutex::new(false),

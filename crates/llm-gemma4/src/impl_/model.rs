@@ -4,7 +4,8 @@ use llm_backend_cpu::{
     buffer::F32Buf,
     dequant::dequant_q8_0,
     matvec::{geglu_q8_0, matvec_bf16, matvec_f32, matvec_q8_0, matvec_q8_0_f32, matvec_q8_0_f64_sums, matvec_q8_0_then, quantize_q8_0, Q8_0_BLOCK_BYTES, Q8_0_BLOCK_VALUES},
-    ops::{dot_f32, gelu_tanh, gelu_tanh_fp16_table, rms_norm, rope_neox, softcap},
+    ops::{dot_f32, gelu_tanh, gelu_tanh_fp16_table, rms_norm, rope_neox, softcap, softmax_f32},
+    pool::map_items,
     port::CpuPort,
 };
 use llm_eng::{
@@ -303,31 +304,63 @@ where
     }
 }
 
-/// Grouped-query attention for one query position: each query head attends
-/// over `keys`/`values` (one entry per position, `n_kv_heads * head_dim`
-/// wide) through the KV head it shares with `n_heads / n_kv_heads` others.
-fn attend(
-    port: &CpuPort,
-    q: &[f32],
-    keys: &[Vec<f32>],
-    values: &[Vec<f32>],
+/// Below this many multiply-adds attention runs on the calling thread.
+const ATTENTION_PARALLEL_MIN_WORK: usize = 1 << 18;
+
+/// One query position's attention inputs, owned so worker threads can share
+/// them: `keys` and `values` hold one `kv_width`-wide row per position.
+struct AttentionInputs {
+    q: Vec<f32>,
+    keys: Vec<f32>,
+    values: Vec<f32>,
+    kv_width: usize,
+    head_dim: usize,
     n_heads: usize,
     n_kv_heads: usize,
     scale: f32,
-) -> Result<Vec<f32>, EngError> {
+}
+
+/// Attention output of query head `head`, which reads the KV head it shares
+/// with `n_heads / n_kv_heads` others. Empty if the softmax input was not
+/// finite.
+fn attend_head(inputs: &AttentionInputs, head: usize) -> Vec<f32> {
+    let head_dim = inputs.head_dim;
+    let qh = &inputs.q[head * head_dim..(head + 1) * head_dim];
+    let kv_head = head * inputs.n_kv_heads / inputs.n_heads;
+    let kv = kv_head * head_dim..(kv_head + 1) * head_dim;
+    let scores: F32Buf = inputs
+        .keys
+        .chunks_exact(inputs.kv_width)
+        .map(|key| dot_f32(qh, &key[kv.clone()]) * inputs.scale)
+        .collect::<Vec<_>>()
+        .into();
+    let Ok(probabilities) = softmax_f32(&scores) else { return Vec::new() };
+    let mut out = vec![0.0; head_dim];
+    for (probability, value) in probabilities.as_slice().iter().zip(inputs.values.chunks_exact(inputs.kv_width)) {
+        for (out, value) in out.iter_mut().zip(&value[kv.clone()]) { *out += probability * value; }
+    }
+    out
+}
+
+/// Grouped-query attention for one query position over `keys`/`values`
+/// (one entry per position, `n_kv_heads * head_dim` wide). Heads run on the
+/// worker threads once the context is long enough to be worth it.
+fn attend(q: &[f32], keys: &[Vec<f32>], values: &[Vec<f32>], n_heads: usize, n_kv_heads: usize, scale: f32) -> Result<Vec<f32>, EngError> {
     let head_dim = q.len() / n_heads;
-    let mut attended = vec![0.0; q.len()];
-    for (head, (qh, out)) in q.chunks_exact(head_dim).zip(attended.chunks_exact_mut(head_dim)).enumerate() {
-        let kv = head * n_kv_heads / n_heads * head_dim..(head * n_kv_heads / n_heads + 1) * head_dim;
-        let scores: F32Buf = keys
-            .iter()
-            .map(|key| dot_f32(qh, &key[kv.clone()]) * scale)
-            .collect::<Vec<_>>()
-            .into();
-        let probabilities = port.softmax(&scores)?;
-        for (probability, value) in probabilities.as_slice().iter().zip(values) {
-            for (out, value) in out.iter_mut().zip(&value[kv.clone()]) { *out += probability * value; }
-        }
+    let inputs = Arc::new(AttentionInputs {
+        q: q.to_vec(),
+        keys: keys.concat(),
+        values: values.concat(),
+        kv_width: n_kv_heads * head_dim,
+        head_dim,
+        n_heads,
+        n_kv_heads,
+        scale,
+    });
+    let work_per_head = 2 * keys.len() * head_dim;
+    let attended = map_items(inputs, n_heads, work_per_head, ATTENTION_PARALLEL_MIN_WORK, attend_head);
+    if attended.len() != q.len() {
+        return Err(EngError::Compute("softmax input is not finite".into()));
     }
     Ok(attended)
 }
@@ -374,7 +407,7 @@ where
         let (keys, values) = self.context.view(source, position + 1)?;
         let range = match kind { AttentionKind::Local { window } => LocalWindowPolicy::new(window).range(keys.len()), AttentionKind::Global => GlobalPolicy.range(keys.len()) };
         // q and k are RMS-normalized, so Gemma 4 uses no 1/sqrt(head_dim) scaling.
-        let attended = attend(&self.port, q.as_slice(), &keys[range.clone()], &values[range], n_heads, n_kv_heads, 1.0)?;
+        let attended = attend(q.as_slice(), &keys[range.clone()], &values[range], n_heads, n_kv_heads, 1.0)?;
         let attention = self.project(&attended, &blk(layer, "attn_output"), d)?;
         let attention = self.norm(attention.as_slice(), &blk(layer, "post_attention_norm"))?;
         let residual = self.port.add(&input, &attention)?;
