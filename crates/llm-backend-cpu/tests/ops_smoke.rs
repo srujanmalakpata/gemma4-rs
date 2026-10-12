@@ -2,7 +2,7 @@ use half::f16;
 use llm_backend_cpu::buffer::F32Buf;
 use llm_backend_cpu::dequant::dequant_q8_0;
 use llm_backend_cpu::ops::{
-    add_f32, matmul_f32, rms_norm, rms_norm_f32, rope_f32, softmax_f32,
+    add_f32, gelu_tanh, matmul_f32, rms_norm, rms_norm_f32, rope_f32, softmax_f32,
 };
 use llm_backend_cpu::port::CpuPort;
 use llm_eng::compute::ComputePort;
@@ -52,6 +52,15 @@ fn rms_norm_uses_weights_as_plain_scales_or_none() {
     let unweighted = rms_norm(&[3.0, 4.0], None, 0.0).unwrap();
     assert!((unweighted[0] - 0.848_528_15).abs() < 1e-6);
     assert!(rms_norm(&[3.0, 4.0], Some(&[1.0]), 0.0).is_err());
+}
+
+#[test]
+fn gelu_tanh_matches_pytorch_tanh_approximation() {
+    assert_eq!(gelu_tanh(0.0), 0.0);
+    // torch.nn.functional.gelu(x, approximate="tanh") for x = 1, -1, 3.
+    assert!((gelu_tanh(1.0) - 0.841_192).abs() < 1e-6);
+    assert!((gelu_tanh(-1.0) + 0.158_808).abs() < 1e-6);
+    assert!((gelu_tanh(3.0) - 2.996_363_7).abs() < 1e-6);
 }
 
 #[test]

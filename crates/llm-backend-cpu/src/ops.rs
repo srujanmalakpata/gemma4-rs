@@ -59,6 +59,14 @@ pub fn rms_norm_f32(x: &F32Buf, weight: &F32Buf, eps: f32) -> Result<F32Buf, Eng
     rms_norm(x.as_slice(), Some(weight.as_slice()), eps).map(F32Buf::from)
 }
 
+/// GELU with the tanh approximation (`gelu_pytorch_tanh`, Gemma's FFN
+/// activation), with ggml's constants.
+pub fn gelu_tanh(x: f32) -> f32 {
+    const SQRT_2_OVER_PI: f32 = 0.797_884_6;
+    const COEF_A: f32 = 0.044_715;
+    0.5 * x * (1.0 + (SQRT_2_OVER_PI * x * (1.0 + COEF_A * x * x)).tanh())
+}
+
 pub fn softmax_f32(x: &F32Buf) -> Result<F32Buf, EngError> {
     let Some(&max) = x
         .as_slice()

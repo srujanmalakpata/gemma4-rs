@@ -2,7 +2,7 @@ use llm_backend_cpu::{
     buffer::F32Buf,
     dequant::dequant_q8_0,
     matvec::{matvec_bf16, matvec_f32, matvec_q8_0, quantize_q8_0, Q8_0_BLOCK_BYTES, Q8_0_BLOCK_VALUES},
-    ops::rms_norm,
+    ops::{gelu_tanh, rms_norm},
     port::CpuPort,
 };
 use llm_eng::{
@@ -280,7 +280,7 @@ where
         let d_ff = self.rows(&blk(layer, "ffn_gate"), d)?;
         let gate = self.project(ffn_input.as_slice(), &blk(layer, "ffn_gate"), d_ff)?;
         let up = self.project(ffn_input.as_slice(), &blk(layer, "ffn_up"), d_ff)?;
-        let gated: Vec<f32> = gate.as_slice().iter().zip(up.as_slice()).map(|(&g, &u)| g / (1.0 + (-g).exp()) * u).collect();
+        let gated: Vec<f32> = gate.as_slice().iter().zip(up.as_slice()).map(|(&g, &u)| gelu_tanh(g) * u).collect();
         let ffn = self.project(&gated, &blk(layer, "ffn_down"), d)?;
         let ffn = self.norm(ffn.as_slice(), &blk(layer, "post_ffw_norm"))?;
         let mut output = self.port.add(&residual, &ffn)?;
