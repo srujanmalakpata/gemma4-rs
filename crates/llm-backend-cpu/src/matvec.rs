@@ -5,8 +5,12 @@
 //! the inner loops are integer or bf16 dot products. Weights are row-major
 //! `[rows, cols]` and the result is `W @ x`.
 
+use std::{borrow::Borrow, sync::Arc};
+
 use half::f16;
 use llm_eng::EngError;
+
+use crate::pool::map_indices;
 
 pub const Q8_0_BLOCK_VALUES: usize = 32;
 pub const Q8_0_BLOCK_BYTES: usize = 34;
@@ -51,96 +55,99 @@ pub fn quantize_q8_0(x: &[f32]) -> Result<Q8Activation, EngError> {
 
 /// `W @ x` for Q8_0 weights: each row is `cols / 32` blocks of an f16 scale
 /// followed by 32 int8 values.
-pub fn matvec_q8_0(weights: &[u8], rows: usize, x: &Q8Activation) -> Result<Vec<f32>, EngError> {
+pub fn matvec_q8_0(weights: &Arc<Vec<u8>>, rows: usize, x: Q8Activation) -> Result<Vec<f32>, EngError> {
     let cols = x.quants.len();
-    let row_bytes = cols / Q8_0_BLOCK_VALUES * Q8_0_BLOCK_BYTES;
-    check_shape(weights.len(), rows, row_bytes, "Q8_0")?;
-    Ok(parallel_rows(rows, cols, |row| {
-        let row = &weights[row * row_bytes..(row + 1) * row_bytes];
-        row.chunks_exact(Q8_0_BLOCK_BYTES)
-            .zip(x.quants.chunks_exact(Q8_0_BLOCK_VALUES).zip(&x.scales))
-            .map(|(block, (quants, &x_scale))| {
-                let w_scale = f16::from_le_bytes([block[0], block[1]]).to_f32();
-                let dot: i32 = block[2..]
-                    .iter()
-                    .zip(quants)
-                    .map(|(&w, &q)| i32::from(w as i8) * i32::from(q))
-                    .sum();
-                dot as f32 * (w_scale * x_scale)
-            })
-            .sum()
-    }))
+    let row_len = cols / Q8_0_BLOCK_VALUES * Q8_0_BLOCK_BYTES;
+    check_shape(weights.len(), rows, row_len, "Q8_0")?;
+    Ok(map_rows(weights, row_len, rows, cols, x, dot_q8_0))
 }
 
 /// `W @ x` for Q8_0 weights with an unquantized f32 activation: each weight
 /// block is dequantized on the fly. Slower than [`matvec_q8_0`], but the
 /// only rounding is in the stored weights.
-pub fn matvec_q8_0_f32(weights: &[u8], rows: usize, x: &[f32]) -> Result<Vec<f32>, EngError> {
-    let cols = x.len();
-    if !cols.is_multiple_of(Q8_0_BLOCK_VALUES) {
-        return Err(EngError::Compute(format!("Q8_0 row length {cols} is not a multiple of {Q8_0_BLOCK_VALUES}")));
-    }
-    let row_bytes = cols / Q8_0_BLOCK_VALUES * Q8_0_BLOCK_BYTES;
-    check_shape(weights.len(), rows, row_bytes, "Q8_0")?;
-    Ok(parallel_rows(rows, cols, |row| {
-        let row = &weights[row * row_bytes..(row + 1) * row_bytes];
-        row.chunks_exact(Q8_0_BLOCK_BYTES)
-            .zip(x.chunks_exact(Q8_0_BLOCK_VALUES))
-            .map(|(block, x)| {
-                let scale = f16::from_le_bytes([block[0], block[1]]).to_f32();
-                let dot: f32 = block[2..].iter().zip(x).map(|(&w, &x)| f32::from(w as i8) * x).sum();
-                dot * scale
-            })
-            .sum()
-    }))
+pub fn matvec_q8_0_f32(weights: &Arc<Vec<u8>>, rows: usize, x: &[f32]) -> Result<Vec<f32>, EngError> {
+    let row_len = q8_0_row_len(x.len())?;
+    check_shape(weights.len(), rows, row_len, "Q8_0")?;
+    Ok(map_rows(weights, row_len, rows, x.len(), x.to_vec(), dot_q8_0_f32))
 }
 
 /// Like [`matvec_q8_0_f32`], but every sum is taken in f64. Slower, with
 /// almost no rounding in the sums; comparing the two shows how much float
 /// summation order alone moves a model's output.
-pub fn matvec_q8_0_f64_sums(weights: &[u8], rows: usize, x: &[f32]) -> Result<Vec<f32>, EngError> {
-    let cols = x.len();
-    if !cols.is_multiple_of(Q8_0_BLOCK_VALUES) {
-        return Err(EngError::Compute(format!("Q8_0 row length {cols} is not a multiple of {Q8_0_BLOCK_VALUES}")));
-    }
-    let row_bytes = cols / Q8_0_BLOCK_VALUES * Q8_0_BLOCK_BYTES;
-    check_shape(weights.len(), rows, row_bytes, "Q8_0")?;
-    Ok(parallel_rows(rows, cols, |row| {
-        let row = &weights[row * row_bytes..(row + 1) * row_bytes];
-        let sum: f64 = row
-            .chunks_exact(Q8_0_BLOCK_BYTES)
-            .zip(x.chunks_exact(Q8_0_BLOCK_VALUES))
-            .map(|(block, x)| {
-                let scale = f64::from(f16::from_le_bytes([block[0], block[1]]).to_f32());
-                let dot: f64 = block[2..].iter().zip(x).map(|(&w, &x)| f64::from(w as i8) * f64::from(x)).sum();
-                dot * scale
-            })
-            .sum();
-        sum as f32
-    }))
+pub fn matvec_q8_0_f64_sums(weights: &Arc<Vec<u8>>, rows: usize, x: &[f32]) -> Result<Vec<f32>, EngError> {
+    let row_len = q8_0_row_len(x.len())?;
+    check_shape(weights.len(), rows, row_len, "Q8_0")?;
+    Ok(map_rows(weights, row_len, rows, x.len(), x.to_vec(), dot_q8_0_f64_sums))
 }
 
 /// `W @ x` for BF16 weights; `x` is rounded to bf16 first, as ggml does.
-pub fn matvec_bf16(weights: &[u16], rows: usize, x: &[f32]) -> Result<Vec<f32>, EngError> {
+pub fn matvec_bf16(weights: &Arc<Vec<u16>>, rows: usize, x: &[f32]) -> Result<Vec<f32>, EngError> {
     let cols = x.len();
     check_shape(weights.len(), rows, cols, "BF16")?;
     let x: Vec<f32> = x.iter().map(|&value| bf16_to_f32(f32_to_bf16(value))).collect();
-    Ok(parallel_rows(rows, cols, |row| {
-        weights[row * cols..(row + 1) * cols]
-            .iter()
-            .zip(&x)
-            .map(|(&w, &x)| bf16_to_f32(w) * x)
-            .sum()
-    }))
+    Ok(map_rows(weights, cols, rows, cols, x, dot_bf16))
 }
 
 /// `W @ x` for f32 weights.
-pub fn matvec_f32(weights: &[f32], rows: usize, x: &[f32]) -> Result<Vec<f32>, EngError> {
+pub fn matvec_f32(weights: &Arc<Vec<f32>>, rows: usize, x: &[f32]) -> Result<Vec<f32>, EngError> {
     let cols = x.len();
     check_shape(weights.len(), rows, cols, "f32")?;
-    Ok(parallel_rows(rows, cols, |row| {
-        weights[row * cols..(row + 1) * cols].iter().zip(x).map(|(w, x)| w * x).sum()
-    }))
+    Ok(map_rows(weights, cols, rows, cols, x.to_vec(), dot_f32))
+}
+
+fn dot_q8_0(row: &[u8], x: &Q8Activation) -> f32 {
+    row.chunks_exact(Q8_0_BLOCK_BYTES)
+        .zip(x.quants.chunks_exact(Q8_0_BLOCK_VALUES).zip(&x.scales))
+        .map(|(block, (quants, &x_scale))| {
+            let w_scale = f16::from_le_bytes([block[0], block[1]]).to_f32();
+            let dot: i32 = block[2..]
+                .iter()
+                .zip(quants)
+                .map(|(&w, &q)| i32::from(w as i8) * i32::from(q))
+                .sum();
+            dot as f32 * (w_scale * x_scale)
+        })
+        .sum()
+}
+
+fn dot_q8_0_f32(row: &[u8], x: &[f32]) -> f32 {
+    row.chunks_exact(Q8_0_BLOCK_BYTES)
+        .zip(x.chunks_exact(Q8_0_BLOCK_VALUES))
+        .map(|(block, x)| {
+            let scale = f16::from_le_bytes([block[0], block[1]]).to_f32();
+            let dot: f32 = block[2..].iter().zip(x).map(|(&w, &x)| f32::from(w as i8) * x).sum();
+            dot * scale
+        })
+        .sum()
+}
+
+fn dot_q8_0_f64_sums(row: &[u8], x: &[f32]) -> f32 {
+    let sum: f64 = row
+        .chunks_exact(Q8_0_BLOCK_BYTES)
+        .zip(x.chunks_exact(Q8_0_BLOCK_VALUES))
+        .map(|(block, x)| {
+            let scale = f64::from(f16::from_le_bytes([block[0], block[1]]).to_f32());
+            let dot: f64 = block[2..].iter().zip(x).map(|(&w, &x)| f64::from(w as i8) * f64::from(x)).sum();
+            dot * scale
+        })
+        .sum();
+    sum as f32
+}
+
+fn dot_bf16(row: &[u16], x: &[f32]) -> f32 {
+    row.iter().zip(x).map(|(&w, &x)| bf16_to_f32(w) * x).sum()
+}
+
+fn dot_f32(row: &[f32], x: &[f32]) -> f32 {
+    row.iter().zip(x).map(|(w, x)| w * x).sum()
+}
+
+fn q8_0_row_len(cols: usize) -> Result<usize, EngError> {
+    if cols.is_multiple_of(Q8_0_BLOCK_VALUES) {
+        Ok(cols / Q8_0_BLOCK_VALUES * Q8_0_BLOCK_BYTES)
+    } else {
+        Err(EngError::Compute(format!("Q8_0 row length {cols} is not a multiple of {Q8_0_BLOCK_VALUES}")))
+    }
 }
 
 pub fn bf16_to_f32(bits: u16) -> f32 {
@@ -166,28 +173,30 @@ fn check_shape(len: usize, rows: usize, row_len: usize, kind: &str) -> Result<()
     }
 }
 
-/// Below this many multiply-adds a mat-vec runs on one thread, since
-/// starting threads would cost more than it saves.
+/// Below this many multiply-adds a mat-vec runs on the calling thread,
+/// since handing it to the workers would cost more than it saves.
 const PARALLEL_MIN_WORK: usize = 1 << 20;
 
-/// Evaluates `row_value` for every row, split across threads for large
-/// matrices.
-fn parallel_rows(rows: usize, cols: usize, row_value: impl Fn(usize) -> f32 + Sync) -> Vec<f32> {
-    let threads = std::thread::available_parallelism().map_or(1, usize::from);
-    if threads == 1 || rows * cols < PARALLEL_MIN_WORK {
-        return (0..rows).map(row_value).collect();
-    }
-    let mut out = vec![0.0; rows];
-    let chunk = rows.div_ceil(threads);
-    std::thread::scope(|scope| {
-        for (index, part) in out.chunks_mut(chunk).enumerate() {
-            let row_value = &row_value;
-            scope.spawn(move || {
-                for (offset, value) in part.iter_mut().enumerate() {
-                    *value = row_value(index * chunk + offset);
-                }
-            });
-        }
-    });
-    out
+/// One mat-vec as a job the worker threads can share. The job owns its
+/// activation `x` and hands `dot` a borrowed view of it (`&[f32]` for a
+/// `Vec<f32>`).
+struct Rows<W, X, V: ?Sized> {
+    weights: Arc<Vec<W>>,
+    row_len: usize,
+    x: X,
+    dot: fn(&[W], &V) -> f32,
+}
+
+/// Computes `dot(row, x)` for every row of `weights`, split across the
+/// worker threads for large matrices.
+fn map_rows<W, X, V>(weights: &Arc<Vec<W>>, row_len: usize, rows: usize, cols: usize, x: X, dot: fn(&[W], &V) -> f32) -> Vec<f32>
+where
+    W: Send + Sync + 'static,
+    X: Borrow<V> + Send + Sync + 'static,
+    V: ?Sized + 'static,
+{
+    let job = Arc::new(Rows { weights: Arc::clone(weights), row_len, x, dot });
+    map_indices(job, rows, cols, PARALLEL_MIN_WORK, |job, row| {
+        (job.dot)(&job.weights[row * job.row_len..(row + 1) * job.row_len], job.x.borrow())
+    })
 }

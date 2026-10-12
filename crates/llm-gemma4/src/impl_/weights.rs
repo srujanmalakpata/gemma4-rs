@@ -1,4 +1,4 @@
-use std::path::Path;
+use std::{path::Path, sync::Arc};
 
 use half::f16;
 use llm_eng::weight_store::{TensorBlob, WeightStore};
@@ -50,29 +50,31 @@ pub fn load_gemma4_e2b(path: impl AsRef<Path>) -> Result<WeightStore, WeightLoad
         let nrows = info.numel() / ncols.max(1);
         let bytes = gguf.read_tensor_bytes(&name)?;
         let blob = match ty {
-            TensorType::F32 => TensorBlob::F32(
+            TensorType::F32 => TensorBlob::F32(Arc::new(
                 bytes
                     .chunks_exact(4)
                     .map(|bytes| f32::from_le_bytes(bytes.try_into().expect("exact chunk size")))
                     .collect(),
-            ),
-            TensorType::F16 => TensorBlob::F32(
+            )),
+            TensorType::F16 => TensorBlob::F32(Arc::new(
                 bytes
                     .chunks_exact(2)
                     .map(|bytes| {
                         f16::from_le_bytes(bytes.try_into().expect("exact chunk size")).to_f32()
                     })
                     .collect(),
-            ),
+            )),
             TensorType::BF16 => TensorBlob::Bf16 {
-                data: bytes
-                    .chunks_exact(2)
-                    .map(|bytes| u16::from_le_bytes([bytes[0], bytes[1]]))
-                    .collect(),
+                data: Arc::new(
+                    bytes
+                        .chunks_exact(2)
+                        .map(|bytes| u16::from_le_bytes([bytes[0], bytes[1]]))
+                        .collect(),
+                ),
                 nrows,
                 ncols,
             },
-            TensorType::Q8_0 => TensorBlob::Q8 { data: bytes, nrows, ncols },
+            TensorType::Q8_0 => TensorBlob::Q8 { data: Arc::new(bytes), nrows, ncols },
         };
         weights.insert(name, blob);
     }

@@ -1,3 +1,5 @@
+use std::sync::Arc;
+
 use half::f16;
 use llm_backend_cpu::dequant::dequant_q8_0;
 use llm_backend_cpu::matvec::{
@@ -49,7 +51,7 @@ fn quantize_q8_0_uses_max_over_127_and_rounds_half_to_even() {
 #[test]
 fn q8_0_matvec_equals_the_dot_product_of_the_dequantized_values() {
     let (rows, cols) = (64, 256);
-    let bytes = q8_0_bytes(&values(1, rows * cols));
+    let bytes = Arc::new(q8_0_bytes(&values(1, rows * cols)));
     let x = quantize_q8_0(&values(2, cols)).unwrap();
     let x_dequantized: Vec<f32> = x
         .quants()
@@ -58,7 +60,7 @@ fn q8_0_matvec_equals_the_dot_product_of_the_dequantized_values() {
         .flat_map(|(quants, scale)| quants.iter().map(move |&q| f32::from(q) * scale))
         .collect();
     let expected = naive(&dequant_q8_0(&bytes).unwrap(), &x_dequantized);
-    let actual = matvec_q8_0(&bytes, rows, &x).unwrap();
+    let actual = matvec_q8_0(&bytes, rows, x).unwrap();
     for (e, a) in expected.iter().zip(&actual) {
         assert!((e - a).abs() < 1e-4, "{e} vs {a}");
     }
@@ -67,7 +69,7 @@ fn q8_0_matvec_equals_the_dot_product_of_the_dequantized_values() {
 #[test]
 fn q8_0_matvec_with_f32_activations_equals_the_dequantized_product() {
     let (rows, cols) = (64, 256);
-    let bytes = q8_0_bytes(&values(1, rows * cols));
+    let bytes = Arc::new(q8_0_bytes(&values(1, rows * cols)));
     let x = values(2, cols);
     let expected = naive(&dequant_q8_0(&bytes).unwrap(), &x);
     let actual = matvec_q8_0_f32(&bytes, rows, &x).unwrap();
@@ -84,7 +86,7 @@ fn q8_0_matvec_is_close_to_the_f32_product() {
     let weights = values(1, rows * cols);
     let x = values(2, cols);
     let expected = naive(&weights, &x);
-    let actual = matvec_q8_0(&q8_0_bytes(&weights), rows, &quantize_q8_0(&x).unwrap()).unwrap();
+    let actual = matvec_q8_0(&Arc::new(q8_0_bytes(&weights)), rows, quantize_q8_0(&x).unwrap()).unwrap();
     // Two 8-bit roundings per term over 256 terms: a few hundredths.
     for (e, a) in expected.iter().zip(&actual) {
         assert!((e - a).abs() < 0.25, "{e} vs {a}");
@@ -93,11 +95,12 @@ fn q8_0_matvec_is_close_to_the_f32_product() {
 
 #[test]
 fn large_matvecs_split_across_threads_give_the_same_result() {
-    let (rows, cols) = (1024, 1024);
+    // 2^20 multiply-adds or more go to the worker threads, in chunks.
+    let (rows, cols) = (1031, 1024);
     let weights = values(3, rows * cols);
     let x = values(4, cols);
     let expected = naive(&weights, &x);
-    let actual = matvec_f32(&weights, rows, &x).unwrap();
+    let actual = matvec_f32(&Arc::new(weights), rows, &x).unwrap();
     assert_eq!(actual.len(), rows);
     for (e, a) in expected.iter().zip(&actual) {
         assert!((e - a).abs() < 1e-3, "{e} vs {a}");
@@ -112,13 +115,13 @@ fn bf16_rounds_to_nearest_even_and_matvec_uses_rounded_inputs() {
     assert_eq!(f32_to_bf16(1.0 + 3.0 / 256.0), 0x3f82);
     assert_eq!(bf16_to_f32(0x3f82), 1.015625);
 
-    let weights = [f32_to_bf16(2.0), f32_to_bf16(-0.5)];
+    let weights = Arc::new(vec![f32_to_bf16(2.0), f32_to_bf16(-0.5)]);
     let out = matvec_bf16(&weights, 1, &[1.0 + 1.0 / 256.0, 4.0]).unwrap();
     assert_eq!(out, [2.0 * 1.0 - 0.5 * 4.0]);
 }
 
 #[test]
 fn shape_mismatches_are_errors() {
-    assert!(matvec_f32(&[1.0; 6], 4, &[1.0, 1.0]).is_err());
+    assert!(matvec_f32(&Arc::new(vec![1.0; 6]), 4, &[1.0, 1.0]).is_err());
     assert!(quantize_q8_0(&[1.0; 31]).is_err());
 }

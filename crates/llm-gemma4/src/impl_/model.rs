@@ -1,3 +1,5 @@
+use std::sync::Arc;
+
 use llm_backend_cpu::{
     buffer::F32Buf,
     dequant::dequant_q8_0,
@@ -98,16 +100,16 @@ where
         hp.validate().expect("synthetic hyperparameters");
         let mut state = seed;
         let mut weights = WeightStore::default();
-        weights.insert(ROPE_FREQS, TensorBlob::F32(proportional_rope_freq_factors(hp.head_dim_global, hp.global_p_rope.p)));
+        weights.insert(ROPE_FREQS, TensorBlob::F32(Arc::new(proportional_rope_freq_factors(hp.head_dim_global, hp.global_p_rope.p))));
         let d = hp.d_model;
         let d_ff = 2 * d;
         // Matrices get small values around 0, norm scales values around 1.
         let mut insert = |name: String, len: usize| {
             let center = if name.contains("norm") || name.contains("scale") { 1.0 } else { 0.0 };
-            weights.insert(name, TensorBlob::F32((0..len).map(|_| {
+            weights.insert(name, TensorBlob::F32(Arc::new((0..len).map(|_| {
                 state = state.wrapping_mul(6_364_136_223_846_793_005).wrapping_add(1);
                 center + ((state >> 40) as f32 / (1u32 << 24) as f32 - 0.5) * 0.2
-            }).collect()));
+            }).collect())));
         };
         insert(TOKEN_EMBD.into(), hp.vocab_size * d);
         insert(OUTPUT_NORM.into(), d);
@@ -206,7 +208,7 @@ where
             TensorBlob::Q8 { data, nrows, ncols } => {
                 if (*nrows, *ncols) != (out, x.len()) { return Err(shape_error()); }
                 if self.numerics.quantize_q8_activations {
-                    matvec_q8_0(data, out, &quantize_q8_0(x)?)?
+                    matvec_q8_0(data, out, quantize_q8_0(x)?)?
                 } else if self.numerics.f64_sums {
                     matvec_q8_0_f64_sums(data, out, x)?
                 } else {
