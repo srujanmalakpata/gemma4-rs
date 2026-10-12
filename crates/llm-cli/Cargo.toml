@@ -14,5 +14,6 @@ clap.workspace = true
 llm-eng.workspace = true
 llm-gemma4.workspace = true
 llm-gguf.workspace = true
+llm-idea.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true
