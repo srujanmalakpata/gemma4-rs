@@ -309,10 +309,10 @@ fn skip_metadata_value<R: Read>(reader: &mut R, key: &str, ty: u32) -> Result<()
     match ty {
         0 | 1 => skip_bytes(reader, 1),
         2 | 3 => skip_bytes(reader, 2),
-        4 | 5 | 6 => skip_bytes(reader, 4),
+        4..=6 => skip_bytes(reader, 4),
         7 => read_bool(reader).map(|_| ()),
         8 => read_string(reader, "metadata array string").map(|_| ()),
-        10 | 11 | 12 => skip_bytes(reader, 8),
+        10..=12 => skip_bytes(reader, 8),
         _ => Err(GgufError::UnsupportedMetadataType {
             key: key.to_owned(),
             ty,

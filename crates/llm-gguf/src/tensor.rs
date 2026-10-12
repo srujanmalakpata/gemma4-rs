@@ -19,7 +19,7 @@ impl TensorType {
         match self {
             Self::F32 => numel.checked_mul(4),
             Self::F16 => numel.checked_mul(2),
-            Self::Q8_0 if numel % 32 == 0 => numel.checked_div(32)?.checked_mul(34),
+            Self::Q8_0 if numel.is_multiple_of(32) => numel.checked_div(32)?.checked_mul(34),
             Self::Q8_0 => None,
         }
     }

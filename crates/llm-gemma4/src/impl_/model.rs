@@ -25,8 +25,8 @@ pub struct HeadConfig {
 
 impl HeadConfig {
     fn validate(self, d_model: usize) -> Result<usize, EngError> {
-        if self.n_heads == 0 || self.n_kv_heads == 0 || self.n_heads % self.n_kv_heads != 0
-            || d_model % self.n_heads != 0
+        if self.n_heads == 0 || self.n_kv_heads == 0 || !self.n_heads.is_multiple_of(self.n_kv_heads)
+            || !d_model.is_multiple_of(self.n_heads)
         {
             return Err(EngError::Compute("invalid GQA head configuration".into()));
         }

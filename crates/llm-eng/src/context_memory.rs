@@ -5,12 +5,15 @@
 
 use crate::EngError;
 
+/// Cached keys and values for one layer, oldest first.
+pub type KvView<'a, K, V> = (&'a [K], &'a [V]);
+
 pub trait ContextMemory {
     type K;
     type V;
 
     fn append(&mut self, layer: usize, k: Self::K, v: Self::V) -> Result<(), EngError>;
-    fn view(&self, layer: usize, len: usize) -> Result<(&[Self::K], &[Self::V]), EngError>;
+    fn view(&self, layer: usize, len: usize) -> Result<KvView<'_, Self::K, Self::V>, EngError>;
     fn clear(&mut self);
 }
 
@@ -47,7 +50,7 @@ fn append<K, V>(layers: &mut Vec<Layer<K, V>>, layer: usize, k: K, v: V) -> Resu
     Ok(())
 }
 
-fn view<K, V>(layers: &[Layer<K, V>], layer: usize, len: usize) -> Result<(&[K], &[V]), EngError> {
+fn view<K, V>(layers: &[Layer<K, V>], layer: usize, len: usize) -> Result<KvView<'_, K, V>, EngError> {
     let Some(layer) = layers.get(layer) else {
         return if len == 0 {
             Ok((&[], &[]))
@@ -73,7 +76,7 @@ impl<K, V> ContextMemory for KvCache<K, V> {
         append(&mut self.layers, layer, k, v)
     }
 
-    fn view(&self, layer: usize, len: usize) -> Result<(&[K], &[V]), EngError> {
+    fn view(&self, layer: usize, len: usize) -> Result<KvView<'_, K, V>, EngError> {
         view(&self.layers, layer, len)
     }
 
@@ -90,7 +93,7 @@ impl<K, V> ContextMemory for FullRecompute<K, V> {
         append(&mut self.layers, layer, k, v)
     }
 
-    fn view(&self, layer: usize, len: usize) -> Result<(&[K], &[V]), EngError> {
+    fn view(&self, layer: usize, len: usize) -> Result<KvView<'_, K, V>, EngError> {
         view(&self.layers, layer, len)
     }
 

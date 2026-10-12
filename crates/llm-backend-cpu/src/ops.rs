@@ -39,7 +39,7 @@ pub fn matmul_f32(
 }
 
 pub fn rms_norm_f32(x: &F32Buf, weight: &F32Buf, eps: f32) -> Result<F32Buf, EngError> {
-    if x.len() != weight.len() || x.len() == 0 || eps < 0.0 {
+    if x.len() != weight.len() || x.is_empty() || eps < 0.0 {
         return Err(compute_error("invalid RMS norm inputs"));
     }
 
@@ -55,7 +55,7 @@ pub fn rms_norm_f32(x: &F32Buf, weight: &F32Buf, eps: f32) -> Result<F32Buf, Eng
 
 /// Gemma stores RMSNorm weights as a delta, so the effective scale is `1 + weight`.
 pub fn rms_norm_gemma_f32(x: &F32Buf, weight: &F32Buf, eps: f32) -> Result<F32Buf, EngError> {
-    if x.len() != weight.len() || x.len() == 0 || eps < 0.0 {
+    if x.len() != weight.len() || x.is_empty() || eps < 0.0 {
         return Err(compute_error("invalid RMS norm inputs"));
     }
 
@@ -94,7 +94,7 @@ pub fn softmax_f32(x: &F32Buf) -> Result<F32Buf, EngError> {
 }
 
 pub fn rope_f32(x: &mut F32Buf, pos: usize, theta: f32, dims: usize) -> Result<(), EngError> {
-    if dims == 0 || dims % 2 != 0 || dims > x.len() || theta <= 0.0 {
+    if dims == 0 || !dims.is_multiple_of(2) || dims > x.len() || theta <= 0.0 {
         return Err(compute_error("invalid RoPE inputs"));
     }
 

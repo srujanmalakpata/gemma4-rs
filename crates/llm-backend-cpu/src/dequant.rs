@@ -11,7 +11,7 @@ pub enum DequantError {
 }
 
 pub fn dequant_q8_0(bytes: &[u8]) -> Result<Vec<f32>, DequantError> {
-    if bytes.len() % Q8_0_BLOCK_SIZE != 0 {
+    if !bytes.len().is_multiple_of(Q8_0_BLOCK_SIZE) {
         return Err(DequantError::InvalidLength(bytes.len()));
     }
 
