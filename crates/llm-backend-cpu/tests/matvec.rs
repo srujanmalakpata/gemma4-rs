@@ -3,7 +3,7 @@ use std::sync::Arc;
 use half::f16;
 use llm_backend_cpu::dequant::dequant_q8_0;
 use llm_backend_cpu::matvec::{
-    bf16_to_f32, f32_to_bf16, matvec_bf16, matvec_f32, matvec_q8_0, matvec_q8_0_f32, matvec_q8_0_f64_sums, quantize_q8_0,
+    bf16_to_f32, f32_to_bf16, geglu_q8_0, matvec_bf16, matvec_f32, matvec_q8_0, matvec_q8_0_f32, matvec_q8_0_f64_sums, matvec_q8_0_then, quantize_q8_0,
 };
 
 /// Deterministic values in [-1, 1).
@@ -78,6 +78,23 @@ fn q8_0_matvec_with_f32_activations_equals_the_dequantized_product() {
         assert!((e - a).abs() < 1e-4, "{e} vs {a}");
         assert!((e - b).abs() < 1e-4, "{e} vs {b}");
     }
+}
+
+#[test]
+fn fused_kernels_give_the_same_bits_as_separate_steps() {
+    let (rows, cols) = (300, 256);
+    let gate = Arc::new(q8_0_bytes(&values(5, rows * cols)));
+    let up = Arc::new(q8_0_bytes(&values(6, rows * cols)));
+    let x = quantize_q8_0(&values(7, cols)).unwrap();
+    let gelu = |v: f32| 0.5 * v * (1.0 + v.tanh());
+    let g = matvec_q8_0(&gate, rows, x.clone()).unwrap();
+    let u = matvec_q8_0(&up, rows, x.clone()).unwrap();
+    let separate: Vec<f32> = g.iter().zip(&u).map(|(&g, &u)| gelu(g) * u).collect();
+    assert_eq!(geglu_q8_0(&gate, &up, rows, x.clone(), gelu).unwrap(), separate);
+
+    let capped: Vec<f32> = g.iter().map(|&v| (v * 0.5).tanh() * 2.0).collect();
+    let post = |v: f32, cap: f32| (v * cap.recip()).tanh() * cap;
+    assert_eq!(matvec_q8_0_then(&gate, rows, x, post, 2.0).unwrap(), capped);
 }
 
 #[test]

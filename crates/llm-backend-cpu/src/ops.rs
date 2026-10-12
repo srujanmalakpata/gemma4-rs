@@ -75,6 +75,11 @@ pub fn dot_f32(a: &[f32], b: &[f32]) -> f32 {
     lanes.iter().sum::<f32>() + tail
 }
 
+/// Gemma's final-logit soft-cap: `cap * tanh(value / cap)`.
+pub fn softcap(value: f32, cap: f32) -> f32 {
+    (value * cap.recip()).tanh() * cap
+}
+
 /// GELU with the tanh approximation (`gelu_pytorch_tanh`, Gemma's FFN
 /// activation), with ggml's constants.
 pub fn gelu_tanh(x: f32) -> f32 {

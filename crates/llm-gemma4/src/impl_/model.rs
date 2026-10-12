@@ -3,8 +3,8 @@ use std::sync::Arc;
 use llm_backend_cpu::{
     buffer::F32Buf,
     dequant::dequant_q8_0,
-    matvec::{matvec_bf16, matvec_f32, matvec_q8_0, matvec_q8_0_f32, matvec_q8_0_f64_sums, quantize_q8_0, Q8_0_BLOCK_BYTES, Q8_0_BLOCK_VALUES},
-    ops::{dot_f32, gelu_tanh, gelu_tanh_fp16_table, rms_norm, rope_neox},
+    matvec::{geglu_q8_0, matvec_bf16, matvec_f32, matvec_q8_0, matvec_q8_0_f32, matvec_q8_0_f64_sums, matvec_q8_0_then, quantize_q8_0, Q8_0_BLOCK_BYTES, Q8_0_BLOCK_VALUES},
+    ops::{dot_f32, gelu_tanh, gelu_tanh_fp16_table, rms_norm, rope_neox, softcap},
     port::CpuPort,
 };
 use llm_eng::{
@@ -222,6 +222,26 @@ where
         };
         Ok(values.into())
     }
+    /// `gelu(W_gate @ x) * (W_up @ x)` for the FFN of `layer`. With quantized
+    /// activations and Q8_0 weights both mat-vecs and the GELU run as one
+    /// task on the workers; the arithmetic is the same either way.
+    fn gated_ffn_input(&self, x: &[f32], layer: usize, rows: usize) -> Result<Vec<f32>, EngError> {
+        let (gate_name, up_name) = (blk(layer, "ffn_gate"), blk(layer, "ffn_up"));
+        if self.numerics.quantize_q8_activations {
+            if let (TensorBlob::Q8 { data: gate, nrows, ncols }, TensorBlob::Q8 { data: up, nrows: up_rows, ncols: up_cols }) =
+                (self.blob(&gate_name)?, self.blob(&up_name)?)
+            {
+                if (*nrows, *ncols) == (rows, x.len()) && (*up_rows, *up_cols) == (rows, x.len()) {
+                    let gelu = if self.numerics.fp16_gelu { gelu_tanh_fp16_table } else { gelu_tanh };
+                    return geglu_q8_0(gate, up, rows, quantize_q8_0(x)?, gelu);
+                }
+            }
+        }
+        let gate = self.project(x, &gate_name, rows)?;
+        let up = self.project(x, &up_name, rows)?;
+        Ok(gate.as_slice().iter().zip(up.as_slice()).map(|(&g, &u)| self.gelu(g) * u).collect())
+    }
+
     /// The output head; Gemma ties it to the token embeddings.
     fn output_name(&self) -> &'static str {
         if self.weights.get(OUTPUT).is_ok() { OUTPUT } else { TOKEN_EMBD }
@@ -361,9 +381,7 @@ where
 
         let ffn_input = self.norm(residual.as_slice(), &blk(layer, "ffn_norm"))?;
         let d_ff = self.rows(&blk(layer, "ffn_gate"), d)?;
-        let gate = self.project(ffn_input.as_slice(), &blk(layer, "ffn_gate"), d_ff)?;
-        let up = self.project(ffn_input.as_slice(), &blk(layer, "ffn_up"), d_ff)?;
-        let gated: Vec<f32> = gate.as_slice().iter().zip(up.as_slice()).map(|(&g, &u)| self.gelu(g) * u).collect();
+        let gated = self.gated_ffn_input(ffn_input.as_slice(), layer, d_ff)?;
         let ffn = self.project(&gated, &blk(layer, "ffn_down"), d)?;
         let ffn = self.norm(ffn.as_slice(), &blk(layer, "post_ffw_norm"))?;
         let mut output = self.port.add(&residual, &ffn)?;
@@ -386,10 +404,18 @@ where
     }
     fn logits<'a>(&mut self, _: &(), x: ActId, acts: &'a mut CpuActivations) -> Result<&'a [f32], EngError> {
         let normalized = self.norm(acts.get(x)?.as_slice(), OUTPUT_NORM)?;
-        let logits = self.project(normalized.as_slice(), self.output_name(), self.hp.vocab_size)?;
-        // Final logit soft-capping: cap * tanh(logit / cap).
-        let cap = self.hp.final_logit_softcap;
-        let logits: F32Buf = logits.as_slice().iter().map(|logit| (logit * cap.recip()).tanh() * cap).collect::<Vec<_>>().into();
+        let (name, vocab, cap) = (self.output_name(), self.hp.vocab_size, self.hp.final_logit_softcap);
+        // Final logit soft-capping, cap * tanh(logit / cap), on the workers
+        // when the output head is a Q8_0 mat-vec with quantized activations.
+        let logits: Vec<f32> = match self.blob(name)? {
+            TensorBlob::Q8 { data, nrows, ncols }
+                if self.numerics.quantize_q8_activations && (*nrows, *ncols) == (vocab, normalized.len()) =>
+            {
+                matvec_q8_0_then(data, vocab, quantize_q8_0(normalized.as_slice())?, softcap, cap)?
+            }
+            _ => self.project(normalized.as_slice(), name, vocab)?.as_slice().iter().map(|&logit| softcap(logit, cap)).collect(),
+        };
+        let logits: F32Buf = logits.into();
         self.last_logits = logits.as_slice().to_vec();
         let logits = acts.push(logits);
         Ok(acts.get(logits)?.as_slice())

@@ -62,6 +62,46 @@ pub fn matvec_q8_0(weights: &Arc<Vec<u8>>, rows: usize, x: Q8Activation) -> Resu
     Ok(map_rows(weights, row_len, rows, cols, x, dot_q8_0))
 }
 
+/// [`matvec_q8_0`] followed by `post(value, arg)` on every output, done on
+/// the worker threads (used for the logit soft-cap over Gemma's 262,144
+/// vocabulary entries, which was slow on one thread).
+pub fn matvec_q8_0_then(
+    weights: &Arc<Vec<u8>>,
+    rows: usize,
+    x: Q8Activation,
+    post: fn(f32, f32) -> f32,
+    arg: f32,
+) -> Result<Vec<f32>, EngError> {
+    let cols = x.quants.len();
+    let row_len = cols / Q8_0_BLOCK_VALUES * Q8_0_BLOCK_BYTES;
+    check_shape(weights.len(), rows, row_len, "Q8_0")?;
+    let job = Arc::new(MappedRows { weights: Arc::clone(weights), row_len, x, post, arg });
+    Ok(map_indices(job, rows, cols, PARALLEL_MIN_WORK, |job, row| {
+        (job.post)(dot_q8_0(&job.weights[row * job.row_len..(row + 1) * job.row_len], &job.x), job.arg)
+    }))
+}
+
+/// Gemma's gated FFN input in one pass over two Q8_0 matrices of the same
+/// shape: `gelu(gate_row . x) * (up_row . x)` for every row. Fusing them
+/// saves a task per layer and runs GELU on the worker threads.
+pub fn geglu_q8_0(
+    gate: &Arc<Vec<u8>>,
+    up: &Arc<Vec<u8>>,
+    rows: usize,
+    x: Q8Activation,
+    gelu: fn(f32) -> f32,
+) -> Result<Vec<f32>, EngError> {
+    let cols = x.quants.len();
+    let row_len = cols / Q8_0_BLOCK_VALUES * Q8_0_BLOCK_BYTES;
+    check_shape(gate.len(), rows, row_len, "Q8_0")?;
+    check_shape(up.len(), rows, row_len, "Q8_0")?;
+    let job = Arc::new(GegluRows { gate: Arc::clone(gate), up: Arc::clone(up), row_len, x, gelu });
+    Ok(map_indices(job, rows, 2 * cols, PARALLEL_MIN_WORK, |job, row| {
+        let range = row * job.row_len..(row + 1) * job.row_len;
+        (job.gelu)(dot_q8_0(&job.gate[range.clone()], &job.x)) * dot_q8_0(&job.up[range], &job.x)
+    }))
+}
+
 /// `W @ x` for Q8_0 weights with an unquantized f32 activation: each weight
 /// block is dequantized on the fly. Slower than [`matvec_q8_0`], but the
 /// only rounding is in the stored weights.
@@ -185,6 +225,22 @@ struct Rows<W, X, V: ?Sized> {
     row_len: usize,
     x: X,
     dot: fn(&[W], &V) -> f32,
+}
+
+struct MappedRows {
+    weights: Arc<Vec<u8>>,
+    row_len: usize,
+    x: Q8Activation,
+    post: fn(f32, f32) -> f32,
+    arg: f32,
+}
+
+struct GegluRows {
+    gate: Arc<Vec<u8>>,
+    up: Arc<Vec<u8>>,
+    row_len: usize,
+    x: Q8Activation,
+    gelu: fn(f32) -> f32,
 }
 
 /// Computes `dot(row, x)` for every row of `weights`, split across the
