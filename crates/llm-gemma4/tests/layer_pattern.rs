@@ -1,5 +1,5 @@
 use llm_gemma4::eng::{
-    kv_slot, windowed_len, GlobalPolicy, KvSlotError, LocalWindowPolicy,
+    kv_source_layer, windowed_len, GlobalPolicy, KvShareError, LocalWindowPolicy,
 };
 use llm_gemma4::idea::{layer_attention_kind, AttentionKind, Gemma4HyperParams};
 
@@ -11,7 +11,7 @@ fn e2b_locked_hyperparams() {
     assert_eq!(hp.d_model, 1_536);
     assert_eq!(hp.ple_dim, 256);
     assert_eq!(hp.sliding_window, 512);
-    assert_eq!(hp.kv_slots, 20);
+    assert_eq!(hp.shared_kv_layers, 20);
     assert_eq!(hp.local_rope_base, 10_000.0);
     assert_eq!(hp.global_p_rope.p, 0.25);
     assert_eq!(hp.global_p_rope.base, 1_000_000.0);
@@ -41,21 +41,35 @@ fn policies_select_the_expected_context_ranges() {
 }
 
 #[test]
-fn e2b_kv_slots_cover_twenty_evenly_spaced_groups() {
-    assert_eq!(kv_slot(0, 35, 20).unwrap(), 0);
-    assert_eq!(kv_slot(34, 35, 20).unwrap(), 19);
-    assert_eq!(kv_slot(4, 35, 20).unwrap(), 2);
+fn e2b_last_twenty_layers_reuse_layer_13_or_14() {
+    let hp = Gemma4HyperParams::e2b();
+    for layer in 0..15 {
+        assert_eq!(kv_source_layer(&hp, layer), Ok(layer), "layer {layer}");
+    }
+    for layer in 15..35 {
+        let expected = match layer_attention_kind(&hp, layer) {
+            AttentionKind::Local { .. } => 13,
+            AttentionKind::Global => 14,
+        };
+        assert_eq!(kv_source_layer(&hp, layer), Ok(expected), "layer {layer}");
+    }
 }
 
 #[test]
-fn kv_slot_rejects_invalid_inputs() {
-    assert_eq!(kv_slot(0, 0, 20), Err(KvSlotError::ZeroLayers));
-    assert_eq!(kv_slot(0, 35, 0), Err(KvSlotError::ZeroSlots));
+fn kv_source_layer_rejects_invalid_inputs() {
+    let hp = Gemma4HyperParams::e2b();
     assert_eq!(
-        kv_slot(35, 35, 20),
-        Err(KvSlotError::LayerOutOfRange {
-            layer: 35,
-            n_layers: 35
-        })
+        kv_source_layer(&hp, 35),
+        Err(KvShareError::LayerOutOfRange { layer: 35, n_layers: 35 })
+    );
+    let all_shared = Gemma4HyperParams { shared_kv_layers: 35, ..hp.clone() };
+    assert_eq!(
+        kv_source_layer(&all_shared, 0),
+        Err(KvShareError::TooManySharedLayers { shared: 35, n_layers: 35 })
+    );
+    let no_global_owner = Gemma4HyperParams { shared_kv_layers: 31, ..hp };
+    assert_eq!(
+        kv_source_layer(&no_global_owner, 34),
+        Err(KvShareError::NoEarlierLayerOfSameKind { layer: 34 })
     );
 }

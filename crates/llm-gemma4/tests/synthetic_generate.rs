@@ -11,12 +11,14 @@ use llm_idea::types::TokenId;
 
 fn synthetic_hp() -> Gemma4HyperParams {
     Gemma4HyperParams {
-        n_layers: 4,
+        // Layers 0-3 local, 4 global, 5 local, 6 global (last). Layers 5 and
+        // 6 share the caches of layers 3 and 4.
+        n_layers: 7,
         vocab_size: 32,
         d_model: 32,
         ple_dim: 0,
         sliding_window: 8,
-        kv_slots: 2,
+        shared_kv_layers: 2,
         local_rope_base: 10_000.0,
         global_p_rope: GlobalPRope {
             p: 0.25,

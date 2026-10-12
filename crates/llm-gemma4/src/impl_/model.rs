@@ -17,7 +17,7 @@ use llm_idea::{
 };
 
 use crate::{
-    eng::{is_kv_owner, kv_slot, GlobalPolicy, LocalWindowPolicy},
+    eng::{kv_source_layer, GlobalPolicy, LocalWindowPolicy},
     idea::{layer_attention_kind, AttentionKind, Gemma4HyperParams},
 };
 
@@ -277,11 +277,11 @@ where
             self.port.rope(&mut chunk, position, theta, rope_dims)?;
             k.as_mut_slice()[head * head_dim..(head + 1) * head_dim].copy_from_slice(chunk.as_slice());
         }
-        let slot = kv_slot(layer, self.hp.n_layers, self.hp.kv_slots).map_err(|e| EngError::Compute(e.to_string()))?;
-        if is_kv_owner(layer, self.hp.n_layers, self.hp.kv_slots).map_err(|e| EngError::Compute(e.to_string()))? {
-            self.context.append(slot, k.as_slice().to_vec(), v.as_slice().to_vec())?;
+        let source = kv_source_layer(&self.hp, layer).map_err(|e| EngError::Compute(e.to_string()))?;
+        if source == layer {
+            self.context.append(layer, k.as_slice().to_vec(), v.as_slice().to_vec())?;
         }
-        let (keys, values) = self.context.view(slot, position + 1)?;
+        let (keys, values) = self.context.view(source, position + 1)?;
         let range = match layer_attention_kind(&self.hp, layer) { AttentionKind::Local { window } => LocalWindowPolicy::new(window).range(keys.len()), AttentionKind::Global => GlobalPolicy.range(keys.len()) };
         let scale = (head_dim as f32).sqrt().recip();
         let mut attended = vec![0.0; d];

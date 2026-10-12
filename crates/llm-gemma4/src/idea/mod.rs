@@ -19,7 +19,8 @@ pub struct Gemma4HyperParams {
     pub d_model: usize,
     pub ple_dim: usize,
     pub sliding_window: usize,
-    pub kv_slots: usize,
+    /// Number of final layers that reuse an earlier layer's K/V cache.
+    pub shared_kv_layers: usize,
     pub local_rope_base: f32,
     pub global_p_rope: GlobalPRope,
 }
@@ -32,7 +33,7 @@ impl Gemma4HyperParams {
             d_model: 1_536,
             ple_dim: 256,
             sliding_window: 512,
-            kv_slots: 20,
+            shared_kv_layers: 20,
             local_rope_base: 10_000.0,
             global_p_rope: GlobalPRope {
                 p: 0.25,
@@ -54,7 +55,9 @@ impl Gemma4HyperParams {
             d_model: gguf.metadata_usize(&key("embedding_length")).unwrap_or(defaults.d_model),
             vocab_size: gguf.metadata_strings("tokenizer.ggml.tokens").map_or(defaults.vocab_size, <[String]>::len),
             sliding_window: gguf.metadata_usize(&key("sliding_window")).unwrap_or(defaults.sliding_window),
-            kv_slots: gguf.metadata_usize(&key("shared_kv_layers")).unwrap_or(defaults.kv_slots),
+            shared_kv_layers: gguf
+                .metadata_usize(&key("attention.shared_kv_layers"))
+                .unwrap_or(defaults.shared_kv_layers),
             ..defaults
         }
     }
