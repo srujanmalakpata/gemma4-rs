@@ -17,10 +17,10 @@ Reference: llama.cpp release `b11564` (commit `08ffba2`), built CPU-only.
 | Check | Result | How |
 |---|---|---|
 | Tokenizer matches llama.cpp | 20 of 20 strings give identical token ids (special tokens, byte fallback, CJK, emoji, code, newline runs) | `tools/compare/run.sh`, section Tokenizer of [RESULTS.md](tools/compare/RESULTS.md) |
-| Logits match llama.cpp (reference check) | pass, 6 of 6 prompts: same top-1 token at all 119 compared positions, max abs diff at most 0.0494, mean KL at most 2.2e-6. Mean abs diff (0.0033-0.0043) misses the original fixed limit of 0.002 but is within 2x the measured float noise floor (below) | same, section "reference check" |
-| Logits with default (quantized) arithmetic | same top-1 token at 118 of 119 positions, mean KL 5.6e-3. For scale, llama.cpp's own Q8_0 run against its F32-weight run: 118 of 119, mean KL 7.4e-3 | same, section "default arithmetic" (informational) |
+| Logits match llama.cpp (reference check) | pass, 6 of 6 prompts: same top-1 token at all 119 compared positions, max abs diff at most 0.039, mean KL at most 1.4e-6. Mean abs diff (0.0028-0.0040) misses the original fixed limit of 0.002 but is within 2x the measured float noise floor (below) | same, section "reference check" |
+| Logits with default (quantized) arithmetic | same top-1 token at 116 of 119 positions, mean KL 5.9e-3. For scale, llama.cpp's own Q8_0 run against its F32-weight run: 118 of 119, mean KL 7.4e-3 | same, section "default arithmetic" (informational) |
 | Real model metadata, `rope_freqs`, a short generation | pass | `LLM_E2B_GGUF=<path> cargo test --release -p llm-gemma4 --test e2b_smoke` |
-| Unit and synthetic-model tests | 46 pass (3 of them do nothing unless `LLM_E2B_GGUF` is set) | `cargo test --workspace` |
+| Unit and synthetic-model tests | 49 pass (3 of them do nothing unless `LLM_E2B_GGUF` is set) | `cargo test --workspace` |
 | Clippy | no warnings | `cargo clippy --workspace --all-targets -- -D warnings` |
 
 What the logit checks mean:
@@ -57,14 +57,31 @@ Not verified:
 
 ## Speed
 
-On the M5 above, `llm-dump` (default arithmetic) ran at 58.0 ms per token over the 628-token
-prompt and 59.6 ms over a 16-token one, about 17 tokens per second, after a 1.6 s load. That
-includes the full 262,144-wide output layer at every token, and generation does the same work per
-token. This is one measurement on one machine, not a benchmark suite.
+CPU only (no GPU backend), on the Apple M5 above with all 10 cores. The Mac was also running other
+work during these measurements, and the same build's time per token varied by up to 2x between
+runs, so these are ranges with their conditions rather than one benchmark figure:
 
-The prompt is processed one token at a time (no batched prefill), and mat-vecs are split across
-threads with `std::thread::scope`. llama.cpp is much faster on prompts because it batches them:
-7.5 s against 46 s for the 628-token prompt, both including loading (RESULTS.md, run times).
+- `llm-cli` generated a 94-token answer at 29.7 ms per token (33.6 tokens/s) after a 1.8 s load,
+  counting the 19 prompt tokens (it prints this line itself).
+- Median of 5 interleaved `llm-dump` runs on the first 200 tokens of the long compare prompt, with
+  the machine otherwise quiet: 28.8 ms per token with 10 threads, 28.6 with 8 (build 941235a; later
+  commits only made attention and sampling faster).
+- Interleaved against llama.cpp b11564's own CPU decode benchmark (`llama-bench -n 64 -t 8`), in the
+  least disturbed round: llama.cpp 25.9 ms per token, this engine 35.4 ms at a 64-token context and
+  34.9 ms at 628 tokens. When llama.cpp's benchmark ran on a quiet machine on its own it gave
+  36.8 tokens/s (27.2 ms).
+- Before the speed work (commit 3e1382e) the same round gave 41.5 ms (64 tokens) and 51.2 ms (628
+  tokens), and a quiet run earlier gave 58-60 ms (about 17 tokens/s).
+
+How: the mat-vecs read Q8_0 weights with int8 dot products and run on persistent worker threads
+that claim chunks of rows (`LLM_THREADS` sets the count). The FFN gate and up projections run as
+one fused task with GELU, the logit soft-cap runs on the workers, and attention heads run in
+parallel. Sampling picks the top 64 logits in linear time instead of sorting all 262,144. A full
+output layer is computed for every token.
+
+The prompt is still processed one token at a time (no batched prefill), so llama.cpp is much faster
+on long prompts: 10.2 s against 41.0 s for the 628-token prompt, both including loading
+(RESULTS.md, run times).
 
 ## Usage
 
