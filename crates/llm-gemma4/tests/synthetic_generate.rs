@@ -20,7 +20,7 @@ fn synthetic_hp() -> Gemma4HyperParams {
         n_kv_heads: 2,
         head_dim_local: 8,
         head_dim_global: 16,
-        ple_dim: 0,
+        ple_dim: 4,
         sliding_window: 8,
         shared_kv_layers: 2,
         local_rope_base: 10_000.0,

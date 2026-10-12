@@ -163,8 +163,3 @@ pub fn proportional_rope_freq_factors(head_dim: usize, p: f32) -> Vec<f32> {
     let rotated = (head_dim as f32 * p / 2.0) as usize;
     (0..head_dim / 2).map(|pair| if pair < rotated { 1.0 } else { 1e30 }).collect()
 }
-
-/// Extension point for adding the per-layer PLE residual during model execution.
-///
-/// Task 8 will define how `ple` is projected into `hidden`.
-pub fn ple_residual(_hidden: &mut [f32], _ple: &[f32]) {}

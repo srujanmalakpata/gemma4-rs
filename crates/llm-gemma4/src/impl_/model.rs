@@ -26,6 +26,12 @@ const OUTPUT: &str = "output.weight";
 const OUTPUT_NORM: &str = "output_norm.weight";
 /// Per-pair RoPE frequency divisors for global layers.
 const ROPE_FREQS: &str = "rope_freqs.weight";
+/// Per-layer embeddings (PLE): a token table with `ple_dim` values per
+/// layer, a projection of the main embedding into the same shape, and the
+/// norm applied to that projection.
+const PLE_TOKEN_EMBD: &str = "per_layer_token_embd.weight";
+const PLE_MODEL_PROJ: &str = "per_layer_model_proj.weight";
+const PLE_PROJ_NORM: &str = "per_layer_proj_norm.weight";
 
 /// GGUF name of a per-layer weight, e.g. `blk.3.attn_q.weight`.
 fn blk(layer: usize, name: &str) -> String {
@@ -56,7 +62,8 @@ pub struct Gemma4CpuModel<C = KvCache<Vec<f32>, Vec<f32>>> {
     prefill_position: usize,
     last_logits: Vec<f32>,
     eos_token_ids: Vec<u32>,
-    current_token: Option<usize>,
+    /// The current token's per-layer inputs, `n_layers` rows of `ple_dim`.
+    per_layer_inputs: Vec<f32>,
 }
 
 impl<C> Gemma4CpuModel<C>
@@ -74,7 +81,7 @@ where
         let d_ff = 2 * d;
         // Matrices get small values around 0, norm scales values around 1.
         let mut insert = |name: String, len: usize| {
-            let center = if name.contains("norm") { 1.0 } else { 0.0 };
+            let center = if name.contains("norm") || name.contains("scale") { 1.0 } else { 0.0 };
             weights.insert(name, TensorBlob::F32((0..len).map(|_| {
                 state = state.wrapping_mul(6_364_136_223_846_793_005).wrapping_add(1);
                 center + ((state >> 40) as f32 / (1u32 << 24) as f32 - 0.5) * 0.2
@@ -82,7 +89,19 @@ where
         };
         insert(TOKEN_EMBD.into(), hp.vocab_size * d);
         insert(OUTPUT_NORM.into(), d);
+        let ple_width = hp.n_layers * hp.ple_dim;
+        if hp.ple_dim > 0 {
+            insert(PLE_TOKEN_EMBD.into(), hp.vocab_size * ple_width);
+            insert(PLE_MODEL_PROJ.into(), ple_width * d);
+            insert(PLE_PROJ_NORM.into(), hp.ple_dim);
+        }
         for layer in 0..hp.n_layers {
+            if hp.ple_dim > 0 {
+                insert(blk(layer, "inp_gate"), hp.ple_dim * d);
+                insert(blk(layer, "proj"), d * hp.ple_dim);
+                insert(blk(layer, "post_norm"), d);
+            }
+            insert(blk(layer, "layer_output_scale"), 1);
             let head_dim = hp.head_dim(layer);
             let (q_dim, kv_dim) = (hp.n_heads * head_dim, hp.n_kv_heads * head_dim);
             for name in ["attn_norm", "post_attention_norm", "ffn_norm", "post_ffw_norm"] { insert(blk(layer, name), d); }
@@ -104,7 +123,7 @@ where
     }
 
     fn new(weights: WeightStore, hp: Gemma4HyperParams) -> Self {
-        Self { hp, weights, context: C::default(), port: CpuPort, prefill_position: 0, last_logits: Vec::new(), eos_token_ids: Vec::new(), current_token: None }
+        Self { hp, weights, context: C::default(), port: CpuPort, prefill_position: 0, last_logits: Vec::new(), eos_token_ids: Vec::new(), per_layer_inputs: Vec::new() }
     }
 
     /// Tokens that stop generation (`<eos>`, and `<turn|>` for chat).
@@ -173,6 +192,26 @@ where
         if self.weights.get(OUTPUT).is_ok() { OUTPUT } else { TOKEN_EMBD }
     }
     fn layer_position(&self, op: LayerOp) -> usize { match op { LayerOp::Prefill => self.prefill_position, LayerOp::Decode { position } => position } }
+
+    /// Gemma 4's per-layer inputs for `token`, given its scaled embedding:
+    /// `(norm(W_proj @ embedding / sqrt(d_model)) + table[token] * sqrt(ple_dim)) / sqrt(2)`,
+    /// with the norm applied to each layer's `ple_dim` slice.
+    fn per_layer_inputs(&self, token: usize, embedding: &[f32]) -> Result<Vec<f32>, EngError> {
+        let ple_dim = self.hp.ple_dim;
+        let width = self.hp.n_layers * ple_dim;
+        let projection_scale = (self.hp.d_model as f32).sqrt().recip();
+        let projected = self.project(embedding, PLE_MODEL_PROJ, width)?;
+        let table_scale = (ple_dim as f32).sqrt();
+        let table_row = self.row(PLE_TOKEN_EMBD, token, width)?;
+        let input_scale = 2.0_f32.sqrt().recip();
+        let mut inputs = Vec::with_capacity(width);
+        for (projected, table) in projected.as_slice().chunks_exact(ple_dim).zip(table_row.chunks_exact(ple_dim)) {
+            let scaled: Vec<f32> = projected.iter().map(|value| value * projection_scale).collect();
+            let normalized = self.norm(&scaled, PLE_PROJ_NORM)?;
+            inputs.extend(normalized.as_slice().iter().zip(table).map(|(p, t)| (p + t * table_scale) * input_scale));
+        }
+        Ok(inputs)
+    }
 
     /// RMSNorm with a stored weight.
     fn norm(&self, x: &[f32], name: &str) -> Result<F32Buf, EngError> {
@@ -245,10 +284,10 @@ where
     fn embed(&mut self, _: &(), tokens: &[TokenId], acts: &mut CpuActivations) -> Result<ActId, EngError> {
         let token = tokens.last().ok_or_else(|| EngError::Msg("cannot embed an empty token sequence".into()))?.0 as usize;
         if token >= self.hp.vocab_size { return Err(EngError::Compute(format!("token {token} exceeds vocabulary"))); }
-        self.current_token = Some(token);
         // Gemma scales embeddings by sqrt(d_model) before the first layer.
         let scale = (self.hp.d_model as f32).sqrt();
         let embedding: Vec<f32> = self.row(TOKEN_EMBD, token, self.hp.d_model)?.iter().map(|value| value * scale).collect();
+        self.per_layer_inputs = if self.hp.ple_dim > 0 { self.per_layer_inputs(token, &embedding)? } else { Vec::new() };
         Ok(acts.push(embedding.into()))
     }
     fn layer_count(&self, _: &()) -> usize { self.hp.n_layers }
@@ -289,14 +328,20 @@ where
         let ffn = self.project(&gated, &blk(layer, "ffn_down"), d)?;
         let ffn = self.norm(ffn.as_slice(), &blk(layer, "post_ffw_norm"))?;
         let mut output = self.port.add(&residual, &ffn)?;
-        // ponytail: only accepts directly lookupable `[vocab, d_model]` PLE
-        // tensors; add projection variants once a real GGUF exposes one.
-        if self.hp.ple_dim > 0 {
-            if let (Some(ple), Some(token)) = (self.optional_tensor(&blk(layer, "ple")), self.current_token) {
-                if ple.len() == self.hp.vocab_size * d {
-                    for (out, value) in output.as_mut_slice().iter_mut().zip(&ple[token * d..(token + 1) * d]) { *out += value; }
-                }
-            }
+
+        // Per-layer embedding: gate the hidden state down to `ple_dim`, mix in
+        // this layer's slice of the token's per-layer input, project back up.
+        let ple_dim = self.hp.ple_dim;
+        if ple_dim > 0 {
+            let gate = self.project(output.as_slice(), &blk(layer, "inp_gate"), ple_dim)?;
+            let layer_input = &self.per_layer_inputs[layer * ple_dim..(layer + 1) * ple_dim];
+            let gated: Vec<f32> = gate.as_slice().iter().zip(layer_input).map(|(&g, &input)| gelu_tanh(g) * input).collect();
+            let projected = self.project(&gated, &blk(layer, "proj"), d)?;
+            let projected = self.norm(projected.as_slice(), &blk(layer, "post_norm"))?;
+            output = self.port.add(&output, &projected)?;
+        }
+        if let Some(&[scale]) = self.optional_tensor(&blk(layer, "layer_output_scale")) {
+            output.as_mut_slice().iter_mut().for_each(|value| *value *= scale);
         }
         Ok(acts.push(output))
     }
