@@ -3,7 +3,7 @@ use llm_eng::{
     sample::SamplingConfig,
 };
 use llm_gemma4::{
-    generate::{generate_cpu, generate_cpu_recompute, GenerateRequest},
+    generate::{generate_cpu, generate_cpu_recompute, sequence_logits, GenerateRequest},
     idea::{Gemma4HyperParams, GlobalPRope},
     model::Gemma4CpuModel,
 };
@@ -56,6 +56,19 @@ fn generate_matches_between_cache_strategies() {
     assert_eq!(cached_tokens, recomputed_tokens);
     assert_relative_eq(cached.last_logits(), recomputed.last_logits(), 1e-4);
     assert!(cached.last_logits().iter().all(|logit| logit.abs() <= 30.0));
+}
+
+#[test]
+fn sequence_logits_are_causal() {
+    let mut model = Gemma4CpuModel::<KvCache<Vec<f32>, Vec<f32>>>::synthetic(7, synthetic_hp());
+    let tokens: Vec<TokenId> = [1, 2, 3, 4, 5].map(TokenId).to_vec();
+    let short = sequence_logits(&mut model, &tokens[..3]).unwrap();
+    let long = sequence_logits(&mut model, &tokens).unwrap();
+    assert_eq!(short.len(), 3);
+    assert_eq!(long.len(), 5);
+    // Later tokens must not change the logits at earlier positions.
+    assert_eq!(&long[..3], &short[..]);
+    assert_ne!(long[3], long[4]);
 }
 
 fn assert_relative_eq(left: &[f32], right: &[f32], tolerance: f32) {

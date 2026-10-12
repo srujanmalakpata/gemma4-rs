@@ -33,10 +33,10 @@ where
     }
 
     model.clear_context();
-    let mut acts = CpuActivations::default();
     let mut logits = Vec::new();
     for &token in request.prompt_tokens {
-        logits = transformer::prefill(model, &(), &[token], &mut acts)?;
+        // Activations are only needed within one token's forward pass.
+        logits = transformer::prefill(model, &(), &[token], &mut CpuActivations::default())?;
         model.finish_prefill_token();
     }
 
@@ -68,7 +68,7 @@ where
             &(),
             token,
             request.prompt_tokens.len() + generated.len() - 1,
-            &mut acts,
+            &mut CpuActivations::default(),
         )?;
     }
     Ok(generated)
@@ -94,10 +94,9 @@ where
     let mut rng = rand::rngs::StdRng::seed_from_u64(0);
     for _ in 0..request.max_new_tokens {
         model.clear_context();
-        let mut acts = CpuActivations::default();
         let mut logits = Vec::new();
         for &token in &sequence {
-            logits = transformer::prefill(model, &(), &[token], &mut acts)?;
+            logits = transformer::prefill(model, &(), &[token], &mut CpuActivations::default())?;
             model.finish_prefill_token();
         }
         let token = TokenId(sample_logits(&logits, request.sampling.temperature, request.sampling.top_p, request.sampling.top_k, &mut rng));
@@ -111,4 +110,21 @@ where
         sequence.push(token);
     }
     Ok(generated)
+}
+
+/// Runs `tokens` through the model from an empty context and returns the
+/// logits after each one; row `i` scores the token that follows `tokens[i]`.
+pub fn sequence_logits<C>(model: &mut Gemma4CpuModel<C>, tokens: &[TokenId]) -> Result<Vec<Vec<f32>>, EngError>
+where
+    C: ContextMemory<K = Vec<f32>, V = Vec<f32>> + Default,
+{
+    model.clear_context();
+    tokens
+        .iter()
+        .map(|&token| {
+            let logits = transformer::prefill(model, &(), &[token], &mut CpuActivations::default())?;
+            model.finish_prefill_token();
+            Ok(logits)
+        })
+        .collect()
 }
