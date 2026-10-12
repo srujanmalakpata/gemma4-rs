@@ -1,53 +1,53 @@
-use std::io::{Read, Seek};
+//! Gemma 4 tokenizer, following llama.cpp's `gemma4` BPE tokenizer:
+//!
+//! 1. Split special tokens (control, user-defined and unknown types) out of
+//!    the text, longest token first.
+//! 2. In each remaining piece, replace spaces with `▁` and split it into runs
+//!    of newlines and runs of other characters.
+//! 3. BPE-merge each run, starting from single characters and always
+//!    applying the lowest-ranked merge from `tokenizer.ggml.merges` first.
+//! 4. Emit pieces that are not in the vocabulary as `<0xXX>` byte tokens.
+
+use std::{
+    cmp::Reverse,
+    collections::{BinaryHeap, HashMap},
+    io::{Read, Seek},
+};
 
 use llm_gguf::reader::GgufFile;
 use llm_idea::types::TokenId;
 use thiserror::Error;
 
 const TOKENS_KEY: &str = "tokenizer.ggml.tokens";
-const SCORES_KEY: &str = "tokenizer.ggml.scores";
 const TYPES_KEY: &str = "tokenizer.ggml.token_type";
+const MERGES_KEY: &str = "tokenizer.ggml.merges";
 
-/// SentencePiece `tokenizer.ggml.token_type` values (GGUF / llama.cpp convention).
-const SP_NORMAL: i32 = 1;
-const SP_UNKNOWN: i32 = 2;
-const SP_CONTROL: i32 = 3;
-const SP_USER_DEFINED: i32 = 4;
-const SP_UNUSED: i32 = 5;
-const SP_BYTE: i32 = 6;
+/// `tokenizer.ggml.token_type` values (GGUF / llama.cpp convention).
+const TYPE_UNKNOWN: i32 = 2;
+const TYPE_CONTROL: i32 = 3;
+const TYPE_USER_DEFINED: i32 = 4;
+const TYPE_BYTE: i32 = 6;
 
-/// Types eligible for longest-prefix greedy matching on user text.
-/// CONTROL, UNKNOWN, UNUSED, and USER_DEFINED are special/reserved; BYTE is kept
-/// for the unknown-char fallback path (not greedy prefix match).
-fn is_greedy_matchable(token_type: i32) -> bool {
-    if matches!(
-        token_type,
-        SP_UNKNOWN | SP_CONTROL | SP_USER_DEFINED | SP_UNUSED | SP_BYTE
-    ) {
-        return false;
-    }
-    token_type == SP_NORMAL
-}
+const SPACE: char = '▁';
 
 #[derive(Debug, Error)]
 pub enum TokenizerError {
     #[error("GGUF metadata `{0}` is missing")]
     MissingMetadata(&'static str),
-    #[error("tokenizer metadata lengths differ: tokens={tokens}, scores={scores}, token_type={token_types}")]
-    MismatchedMetadata {
-        tokens: usize,
-        scores: usize,
-        token_types: usize,
-    },
+    #[error("tokenizer metadata lengths differ: tokens={tokens}, token_type={token_types}")]
+    MismatchedMetadata { tokens: usize, token_types: usize },
 }
 
 pub struct Tokenizer {
     tokens: Vec<String>,
-    scores: Vec<f32>,
     token_types: Vec<i32>,
+    ids: HashMap<String, u32>,
+    /// Merge rank keyed by `"left right"`, as stored in the GGUF.
+    merge_ranks: HashMap<String, u32>,
+    /// Special tokens, longest text first.
+    specials: Vec<u32>,
     bos: Option<TokenId>,
     eos: Option<TokenId>,
-    unknown: Option<TokenId>,
 }
 
 impl Tokenizer {
@@ -55,58 +55,38 @@ impl Tokenizer {
         let tokens = gguf
             .metadata_strings(TOKENS_KEY)
             .ok_or(TokenizerError::MissingMetadata(TOKENS_KEY))?;
-        let scores = gguf
-            .metadata_f32s(SCORES_KEY)
-            .ok_or(TokenizerError::MissingMetadata(SCORES_KEY))?;
         let token_types = gguf
             .metadata_i32s(TYPES_KEY)
             .ok_or(TokenizerError::MissingMetadata(TYPES_KEY))?;
+        let merges = gguf
+            .metadata_strings(MERGES_KEY)
+            .ok_or(TokenizerError::MissingMetadata(MERGES_KEY))?;
 
         Self::from_parts(
             tokens.to_vec(),
-            scores.to_vec(),
             token_types.to_vec(),
+            merges,
             gguf.metadata_u32("tokenizer.ggml.bos_token_id"),
             gguf.metadata_u32("tokenizer.ggml.eos_token_id"),
         )
     }
 
+    /// Encodes `text`, recognising special tokens such as `<|turn>` written
+    /// in the text (llama.cpp's `parse_special = true`).
     pub fn encode(&self, text: &str, add_bos: bool) -> Vec<TokenId> {
-        // ponytail: greedy SP encode — upgrade to full SentencePiece proto if mismatch vs golden; O(chars×vocab) scan per step
         let mut ids = Vec::new();
         if add_bos {
             ids.extend(self.bos);
         }
-
-        let normalized = text.replace(' ', "▁");
-        let mut remaining = normalized.as_str();
-        while !remaining.is_empty() {
-            let best = self
-                .tokens
-                .iter()
-                .enumerate()
-                .filter(|(id, token)| {
-                    is_greedy_matchable(self.token_types[*id])
-                        && !is_special(token)
-                        && remaining.starts_with(token.as_str())
-                })
-                .max_by(|(left_id, left), (right_id, right)| {
-                    left.len()
-                        .cmp(&right.len())
-                        .then_with(|| self.scores[*left_id].total_cmp(&self.scores[*right_id]))
-                });
-
-            if let Some((id, token)) = best {
-                ids.push(TokenId(id as u32));
-                remaining = &remaining[token.len()..];
-            } else {
-                let next = remaining.chars().next().expect("remaining is non-empty");
-                let byte_id = self.tokens.iter().enumerate().find_map(|(id, token)| {
-                    (self.token_types[id] == SP_BYTE && byte_token(token) == Some(next as u8))
-                        .then_some(TokenId(id as u32))
-                });
-                ids.extend(byte_id.or(self.unknown));
-                remaining = &remaining[next.len_utf8()..];
+        for fragment in split_specials(text, &self.specials, &self.tokens) {
+            match fragment {
+                Fragment::Special(id) => ids.push(TokenId(id)),
+                Fragment::Text(text) => {
+                    let escaped = text.replace(' ', &SPACE.to_string());
+                    for word in split_newline_runs(&escaped) {
+                        ids.extend(self.encode_word(word).into_iter().map(TokenId));
+                    }
+                }
             }
         }
         ids
@@ -114,23 +94,26 @@ impl Tokenizer {
 
     pub fn decode(&self, ids: &[TokenId]) -> String {
         let mut output = String::new();
-        let mut byte_fallback = Vec::new();
+        let mut bytes = Vec::new();
 
         for TokenId(id) in ids {
-            let Some(token) = self.tokens.get(*id as usize) else {
+            let id = *id as usize;
+            let (Some(token), Some(&token_type)) = (self.tokens.get(id), self.token_types.get(id)) else {
                 continue;
             };
-            if let Some(byte) = byte_token(token) {
-                byte_fallback.push(byte);
-                continue;
+            if token_type == TYPE_BYTE {
+                if let Some(byte) = byte_token(token) {
+                    bytes.push(byte);
+                    continue;
+                }
             }
-            flush_bytes(&mut output, &mut byte_fallback);
-            if !is_special(token) {
+            flush_bytes(&mut output, &mut bytes);
+            if !matches!(token_type, TYPE_CONTROL | TYPE_UNKNOWN) {
                 output.push_str(token);
             }
         }
-        flush_bytes(&mut output, &mut byte_fallback);
-        output.replace('▁', " ").trim_start().to_owned()
+        flush_bytes(&mut output, &mut bytes);
+        output.replace(SPACE, " ")
     }
 
     pub fn bos_token_id(&self) -> Option<TokenId> {
@@ -141,39 +124,192 @@ impl Tokenizer {
         self.eos
     }
 
+    /// Tokens that end a model turn: `<eos>` and, for chat, `<turn|>`.
+    pub fn end_of_generation_ids(&self) -> Vec<TokenId> {
+        let turn_end = self.ids.get("<turn|>").map(|&id| TokenId(id));
+        self.eos.into_iter().chain(turn_end).collect()
+    }
+
+    fn encode_word(&self, word: &str) -> Vec<u32> {
+        let pieces = if word.starts_with('\n') && self.ids.contains_key(word) {
+            vec![word]
+        } else {
+            bpe_merge(word, |left, right| self.merge_rank(left, right))
+        };
+        pieces
+            .into_iter()
+            .flat_map(|piece| match self.ids.get(piece) {
+                Some(&id) => vec![id],
+                None => piece
+                    .bytes()
+                    .filter_map(|byte| self.ids.get(&format!("<0x{byte:02X}>")).copied())
+                    .collect(),
+            })
+            .collect()
+    }
+
+    fn merge_rank(&self, left: &str, right: &str) -> Option<u32> {
+        self.merge_ranks.get(&format!("{left} {right}")).copied()
+    }
+
     fn from_parts(
         tokens: Vec<String>,
-        scores: Vec<f32>,
         token_types: Vec<i32>,
+        merges: &[String],
         bos: Option<u32>,
         eos: Option<u32>,
     ) -> Result<Self, TokenizerError> {
-        if tokens.len() != scores.len() || tokens.len() != token_types.len() {
+        if tokens.len() != token_types.len() {
             return Err(TokenizerError::MismatchedMetadata {
                 tokens: tokens.len(),
-                scores: scores.len(),
                 token_types: token_types.len(),
             });
         }
-        let find = |names: &[&str]| {
-            tokens
-                .iter()
-                .position(|token| names.contains(&token.as_str()))
-                .map(|id| TokenId(id as u32))
-        };
+        let ids: HashMap<String, u32> = tokens
+            .iter()
+            .enumerate()
+            .map(|(id, token)| (token.clone(), id as u32))
+            .collect();
+        let merge_ranks = merges
+            .iter()
+            .enumerate()
+            .map(|(rank, merge)| (merge.clone(), rank as u32))
+            .collect();
+        let mut specials: Vec<u32> = (0..tokens.len() as u32)
+            .filter(|&id| {
+                matches!(
+                    token_types[id as usize],
+                    TYPE_CONTROL | TYPE_USER_DEFINED | TYPE_UNKNOWN
+                )
+            })
+            .collect();
+        specials.sort_by_key(|&id| Reverse(tokens[id as usize].len()));
+        let find = |name: &str| ids.get(name).map(|&id| TokenId(id));
         Ok(Self {
-            unknown: find(&["<unk>"]),
-            bos: bos.map(TokenId).or_else(|| find(&["<bos>", "<s>"])),
-            eos: eos.map(TokenId).or_else(|| find(&["<eos>", "</s>"])),
+            bos: bos.map(TokenId).or_else(|| find("<bos>")),
+            eos: eos.map(TokenId).or_else(|| find("<eos>")),
             tokens,
-            scores,
             token_types,
+            ids,
+            merge_ranks,
+            specials,
         })
     }
 }
 
-fn is_special(token: &str) -> bool {
-    matches!(token, "<unk>" | "<bos>" | "<eos>" | "<s>" | "</s>")
+#[derive(Debug, PartialEq, Eq)]
+enum Fragment<'a> {
+    Text(&'a str),
+    Special(u32),
+}
+
+/// Splits every occurrence of each special token out of the text, taking
+/// the special tokens in the order given (llama.cpp uses longest first).
+fn split_specials<'a>(text: &'a str, specials: &[u32], tokens: &[String]) -> Vec<Fragment<'a>> {
+    let mut fragments = if text.is_empty() { Vec::new() } else { vec![Fragment::Text(text)] };
+    for &id in specials {
+        let special = tokens[id as usize].as_str();
+        if special.is_empty() {
+            continue;
+        }
+        fragments = fragments
+            .into_iter()
+            .flat_map(|fragment| match fragment {
+                Fragment::Text(text) => split_on(text, special, id),
+                other => vec![other],
+            })
+            .collect();
+    }
+    fragments
+}
+
+fn split_on<'a>(text: &'a str, special: &str, id: u32) -> Vec<Fragment<'a>> {
+    let mut fragments = Vec::new();
+    let mut rest = text;
+    while let Some(start) = rest.find(special) {
+        if start > 0 {
+            fragments.push(Fragment::Text(&rest[..start]));
+        }
+        fragments.push(Fragment::Special(id));
+        rest = &rest[start + special.len()..];
+    }
+    if !rest.is_empty() {
+        fragments.push(Fragment::Text(rest));
+    }
+    fragments
+}
+
+/// Splits text into maximal runs of `\n` and maximal runs of anything else
+/// (llama.cpp's `[^\n]+|[\n]+` pre-tokenizer for Gemma 4).
+fn split_newline_runs(text: &str) -> Vec<&str> {
+    let mut words = Vec::new();
+    let mut start = 0;
+    let bytes = text.as_bytes();
+    for index in 1..=bytes.len() {
+        if index == bytes.len() || (bytes[index] == b'\n') != (bytes[start] == b'\n') {
+            words.push(&text[start..index]);
+            start = index;
+        }
+    }
+    words
+}
+
+/// Byte-pair merging over the characters of `word`. Repeatedly merges the
+/// adjacent pair with the lowest rank (leftmost on ties), like llama.cpp's
+/// `llm_tokenizer_bpe_session`.
+fn bpe_merge(word: &str, rank: impl Fn(&str, &str) -> Option<u32>) -> Vec<&str> {
+    // Each symbol is a byte range of `word`; merged-away symbols have len 0.
+    struct Symbol {
+        start: usize,
+        len: usize,
+        prev: Option<usize>,
+        next: Option<usize>,
+    }
+    type Queue = BinaryHeap<Reverse<(u32, usize, usize, usize)>>;
+
+    let mut symbols: Vec<Symbol> = word
+        .char_indices()
+        .map(|(start, ch)| Symbol { start, len: ch.len_utf8(), prev: None, next: None })
+        .collect();
+    let count = symbols.len();
+    for (index, symbol) in symbols.iter_mut().enumerate() {
+        symbol.prev = index.checked_sub(1);
+        symbol.next = (index + 1 < count).then_some(index + 1);
+    }
+    let text = |symbol: &Symbol| &word[symbol.start..symbol.start + symbol.len];
+
+    // Min-heap of (rank, left, left_len, right_len).
+    let push = |queue: &mut Queue, symbols: &[Symbol], left: usize| {
+        if let Some(right) = symbols[left].next {
+            if let Some(rank) = rank(text(&symbols[left]), text(&symbols[right])) {
+                queue.push(Reverse((rank, left, symbols[left].len, symbols[right].len)));
+            }
+        }
+    };
+    let mut queue = Queue::new();
+    for left in 0..count {
+        push(&mut queue, &symbols, left);
+    }
+
+    while let Some(Reverse((_, left, left_len, right_len))) = queue.pop() {
+        let Some(right) = symbols[left].next else { continue };
+        // Skip pairs made stale by an earlier merge.
+        if left_len == 0 || symbols[left].len != left_len || symbols[right].len != right_len {
+            continue;
+        }
+        symbols[left].len += right_len;
+        symbols[right].len = 0;
+        symbols[left].next = symbols[right].next;
+        if let Some(next) = symbols[right].next {
+            symbols[next].prev = Some(left);
+        }
+        if let Some(prev) = symbols[left].prev {
+            push(&mut queue, &symbols, prev);
+        }
+        push(&mut queue, &symbols, left);
+    }
+
+    symbols.iter().filter(|symbol| symbol.len > 0).map(text).collect()
 }
 
 fn byte_token(token: &str) -> Option<u8> {
@@ -195,38 +331,77 @@ fn flush_bytes(output: &mut String, bytes: &mut Vec<u8>) {
 mod tests {
     use super::*;
 
-    #[test]
-    fn greedily_encodes_and_decodes_sentencepiece_tokens() {
-        let tokenizer = Tokenizer::from_parts(
-            vec![
-                "<unk>".into(),
-                "<bos>".into(),
-                "<eos>".into(),
-                "▁hello".into(),
-                "▁".into(),
-                "world".into(),
-            ],
-            vec![0.0; 6],
-            vec![
-                SP_UNKNOWN,
-                SP_CONTROL,
-                SP_CONTROL,
-                SP_NORMAL,
-                SP_NORMAL,
-                SP_NORMAL,
-            ],
-            None,
-            None,
-        )
-        .unwrap();
+    const NORMAL: i32 = 1;
 
+    fn tokenizer() -> Tokenizer {
+        let vocab = [
+            ("<pad>", TYPE_CONTROL),
+            ("<eos>", TYPE_CONTROL),
+            ("<bos>", TYPE_CONTROL),
+            ("<|turn>", TYPE_CONTROL),
+            ("<turn|>", TYPE_CONTROL),
+            ("▁", NORMAL),
+            ("h", NORMAL),
+            ("i", NORMAL),
+            ("hi", NORMAL),
+            ("▁hi", NORMAL),
+            ("\n", NORMAL),
+            ("\n\n", NORMAL),
+            ("<0xC3>", TYPE_BYTE),
+            ("<0xA9>", TYPE_BYTE),
+        ];
+        let merges = ["h i", "▁ hi"].map(String::from);
+        Tokenizer::from_parts(
+            vocab.iter().map(|(token, _)| token.to_string()).collect(),
+            vocab.iter().map(|&(_, kind)| kind).collect(),
+            &merges,
+            Some(2),
+            Some(1),
+        )
+        .unwrap()
+    }
+
+    fn ids(values: &[u32]) -> Vec<TokenId> {
+        values.iter().copied().map(TokenId).collect()
+    }
+
+    #[test]
+    fn merges_by_rank_and_maps_spaces() {
+        assert_eq!(tokenizer().encode("hi hi", true), ids(&[2, 8, 9]));
+    }
+
+    #[test]
+    fn splits_special_tokens_out_of_text() {
         assert_eq!(
-            tokenizer.encode(" hello world", true),
-            vec![TokenId(1), TokenId(3), TokenId(4), TokenId(5)]
+            tokenizer().encode("<|turn>hi<turn|>\n", false),
+            ids(&[3, 8, 4, 10])
         );
-        assert_eq!(
-            tokenizer.decode(&[TokenId(3), TokenId(4), TokenId(5)]),
-            "hello world"
-        );
+    }
+
+    #[test]
+    fn keeps_newline_runs_whole_when_the_vocab_has_them() {
+        assert_eq!(tokenizer().encode("hi\n\nhi", false), ids(&[8, 11, 8]));
+    }
+
+    #[test]
+    fn falls_back_to_byte_tokens() {
+        assert_eq!(tokenizer().encode("é", false), ids(&[12, 13]));
+    }
+
+    #[test]
+    fn decode_skips_control_tokens_and_joins_bytes() {
+        let tokenizer = tokenizer();
+        assert_eq!(tokenizer.decode(&ids(&[2, 8, 9, 12, 13, 4])), "hi hié");
+    }
+
+    #[test]
+    fn end_of_generation_includes_turn_end() {
+        assert_eq!(tokenizer().end_of_generation_ids(), ids(&[1, 4]));
+    }
+
+    #[test]
+    fn bpe_prefers_the_leftmost_pair_on_equal_rank() {
+        let rank = |left: &str, right: &str| (left == "a" && right == "a").then_some(0);
+        assert_eq!(bpe_merge("aaa", rank), vec!["aa", "a"]);
     }
 }
